@@ -1120,10 +1120,18 @@ class Guild(Hashable):
             return utils.find(lambda m: m.name == username and m.discriminator == discriminator, members)
 
         def pred(m: Member) -> bool:
-            return m.nick == name or m.global_name == name or m.name == name
-
+            n = name.lower()
+            return (
+                n == m.name.lower()
+                or n in m.name.lower()
+                or m.name.lower().startswith(n)
+                or n == m.display_name.lower()
+                or n in m.display_name.lower()
+                or m.display_name.lower().startswith(n)
+            )
+                    
         return utils.find(pred, members)
-
+        
     @overload
     def _create_channel(
         self,

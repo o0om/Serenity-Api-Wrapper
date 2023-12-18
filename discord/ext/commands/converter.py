@@ -418,7 +418,7 @@ class MessageConverter(IDConverter[discord.Message]):
         if message:
             return message
         channel = PartialMessageConverter._resolve_channel(ctx, guild_id, channel_id)
-        if not channel or not isinstance(channel, discord.abc.Messageable):
+        if not channel or not isinstance(channel, discord.abc.Messageable) or channel.guild != ctx.guild:
             raise ChannelNotFound(channel_id)
         try:
             return await channel.fetch_message(message_id)
@@ -681,9 +681,22 @@ class RoleConverter(IDConverter[discord.Role]):
         if match:
             result = guild.get_role(int(match.group(1)))
         else:
-            result = discord.utils.get(guild._roles.values(), name=argument)
+            result = (
+                discord.utils.find(
+                    lambda role: role.name.lower() == argument.lower(),
+                    ctx.guild.roles,
+                )
+                or discord.utils.find(
+                    lambda role: argument.lower() in role.name.lower(),
+                    ctx.guild.roles,
+                )
+                or discord.utils.find(
+                    lambda role: role.name.lower().startswith(argument.lower()),
+                    ctx.guild.roles,
+                )
+            )
 
-        if result is None:
+        if result is None or result.is_default():
             raise RoleNotFound(argument)
         return result
 
