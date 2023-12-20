@@ -444,9 +444,9 @@ class DiscordWebSocket:
             'd': {
                 'token': self.token,
                 'properties': {
-                    'os': sys.platform,
-                    'browser': 'discord.py',
-                    'device': 'discord.py',
+                    'os': 'Discord iOS',
+                    'browser': 'Discord iOS',
+                    'device': 'Discord iOS',
                 },
                 'compress': True,
                 'large_threshold': 250,
