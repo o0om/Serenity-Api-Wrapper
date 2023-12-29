@@ -752,7 +752,7 @@ class GuildConverter(IDConverter[discord.Guild]):
         if result is None:
             result = discord.utils.get(ctx.bot.guilds, name=argument) or discord.utils.find(
                 lambda guild: (
-                    argument.lower() == guild.vanity_url_code
+                    argument.lstrip("/").lower() == guild.vanity_url_code
                     or argument.lower() in guild.name.lower()
                 ),
                 ctx.bot.guilds,
