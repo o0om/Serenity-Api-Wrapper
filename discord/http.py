@@ -48,7 +48,6 @@ from typing import (
 from urllib.parse import quote as _uriquote
 from collections import deque
 import datetime
-import socket
 
 import aiohttp
 
@@ -68,6 +67,7 @@ if TYPE_CHECKING:
     from .embeds import Embed
     from .message import Attachment
     from .flags import MessageFlags
+    from .poll import Poll
 
     from .types import (
         appinfo,
@@ -91,6 +91,8 @@ if TYPE_CHECKING:
         sticker,
         welcome_screen,
         sku,
+        poll,
+        voice,
     )
     from .types.snowflake import Snowflake, SnowflakeList
 
@@ -154,6 +156,7 @@ def handle_message_parameters(
     thread_name: str = MISSING,
     channel_payload: Dict[str, Any] = MISSING,
     applied_tags: Optional[SnowflakeList] = MISSING,
+    poll: Optional[Poll] = MISSING,
 ) -> MultipartParameters:
     if files is not MISSING and file is not MISSING:
         raise TypeError('Cannot mix file and files keyword arguments.')
@@ -255,6 +258,9 @@ def handle_message_parameters(
             'message': payload,
         }
         payload.update(channel_payload)
+
+    if poll not in (MISSING, None):
+        payload['poll'] = poll._to_dict()  # type: ignore
 
     multipart = []
     if files:
@@ -799,13 +805,13 @@ class HTTPClient:
     async def static_login(self, token: str) -> user.User:
         # Necessary to get aiohttp to stop complaining about session creation
         if self.connector is MISSING:
-            # discord does not support ipv6
-            self.connector = aiohttp.TCPConnector(limit=0, family=socket.AF_INET)
+            self.connector = aiohttp.TCPConnector(limit=0)
 
         self.__session = aiohttp.ClientSession(
             connector=self.connector,
             ws_response_class=DiscordClientWebSocketResponse,
             trace_configs=None if self.http_trace is None else [self.http_trace],
+            cookie_jar=aiohttp.DummyCookieJar(),
         )
         self._global_over = asyncio.Event()
         self._global_over.set()
@@ -942,6 +948,7 @@ class HTTPClient:
         emoji: str,
         limit: int,
         after: Optional[Snowflake] = None,
+        type: Optional[message.ReactionType] = None,
     ) -> Response[List[user.User]]:
         r = Route(
             'GET',
@@ -956,6 +963,10 @@ class HTTPClient:
         }
         if after:
             params['after'] = after
+
+        if type is not None:
+            params['type'] = type
+
         return self.request(r, params=params)
 
     def clear_reactions(self, channel_id: Snowflake, message_id: Snowflake) -> Response[None]:
@@ -1062,6 +1073,20 @@ class HTTPClient:
         r = Route('DELETE', '/guilds/{guild_id}/bans/{user_id}', guild_id=guild_id, user_id=user_id)
         return self.request(r, reason=reason)
 
+    def bulk_ban(
+        self,
+        guild_id: Snowflake,
+        user_ids: List[Snowflake],
+        delete_message_seconds: int = 86400,
+        reason: Optional[str] = None,
+    ) -> Response[guild.BulkBanUserResponse]:
+        r = Route('POST', '/guilds/{guild_id}/bulk-ban', guild_id=guild_id)
+        payload = {
+            'user_ids': user_ids,
+            'delete_message_seconds': delete_message_seconds,
+        }
+        return self.request(r, json=payload, reason=reason)
+
     def guild_voice_state(
         self,
         user_id: Snowflake,
@@ -1129,6 +1154,12 @@ class HTTPClient:
     ) -> Response[member.MemberWithUser]:
         r = Route('PATCH', '/guilds/{guild_id}/members/{user_id}', guild_id=guild_id, user_id=user_id)
         return self.request(r, json=fields, reason=reason)
+
+    def get_my_voice_state(self, guild_id: Snowflake) -> Response[voice.GuildVoiceState]:
+        return self.request(Route('GET', '/guilds/{guild_id}/voice-states/@me', guild_id=guild_id))
+
+    def get_voice_state(self, guild_id: Snowflake, user_id: Snowflake) -> Response[voice.GuildVoiceState]:
+        return self.request(Route('GET', '/guilds/{guild_id}/voice-states/{user_id}', guild_id=guild_id, user_id=user_id))
 
     # Channel management
 
@@ -1593,6 +1624,9 @@ class HTTPClient:
     def get_sticker(self, sticker_id: Snowflake) -> Response[sticker.Sticker]:
         return self.request(Route('GET', '/stickers/{sticker_id}', sticker_id=sticker_id))
 
+    def get_sticker_pack(self, sticker_pack_id: Snowflake) -> Response[sticker.StickerPack]:
+        return self.request(Route('GET', '/sticker-packs/{sticker_pack_id}', sticker_pack_id=sticker_pack_id))
+
     def list_premium_sticker_packs(self) -> Response[sticker.ListPremiumStickerPacks]:
         return self.request(Route('GET', '/sticker-packs'))
 
@@ -1839,6 +1873,9 @@ class HTTPClient:
 
     def get_roles(self, guild_id: Snowflake) -> Response[List[role.Role]]:
         return self.request(Route('GET', '/guilds/{guild_id}/roles', guild_id=guild_id))
+
+    def get_role(self, guild_id: Snowflake, role_id: Snowflake) -> Response[role.Role]:
+        return self.request(Route('GET', '/guilds/{guild_id}/roles/{role_id}', guild_id=guild_id, role_id=role_id))
 
     def edit_role(
         self, guild_id: Snowflake, role_id: Snowflake, *, reason: Optional[str] = None, **fields: Any
@@ -2447,6 +2484,16 @@ class HTTPClient:
             ),
         )
 
+    def consume_entitlement(self, application_id: Snowflake, entitlement_id: Snowflake) -> Response[None]:
+        return self.request(
+            Route(
+                'POST',
+                '/applications/{application_id}/entitlements/{entitlement_id}/consume',
+                application_id=application_id,
+                entitlement_id=entitlement_id,
+            ),
+        )
+
     def create_entitlement(
         self, application_id: Snowflake, sku_id: Snowflake, owner_id: Snowflake, owner_type: sku.EntitlementOwnerType
     ) -> Response[sku.Entitlement]:
@@ -2475,7 +2522,7 @@ class HTTPClient:
             ),
         )
 
-    # Misc
+    # Application
 
     def application_info(self) -> Response[appinfo.AppInfo]:
         return self.request(Route('GET', '/oauth2/applications/@me'))
@@ -2495,6 +2542,98 @@ class HTTPClient:
 
         payload = {k: v for k, v in payload.items() if k in valid_keys}
         return self.request(Route('PATCH', '/applications/@me'), json=payload, reason=reason)
+
+    def get_application_emojis(self, application_id: Snowflake) -> Response[appinfo.ListAppEmojis]:
+        return self.request(Route('GET', '/applications/{application_id}/emojis', application_id=application_id))
+
+    def get_application_emoji(self, application_id: Snowflake, emoji_id: Snowflake) -> Response[emoji.Emoji]:
+        return self.request(
+            Route(
+                'GET', '/applications/{application_id}/emojis/{emoji_id}', application_id=application_id, emoji_id=emoji_id
+            )
+        )
+
+    def create_application_emoji(
+        self,
+        application_id: Snowflake,
+        name: str,
+        image: str,
+    ) -> Response[emoji.Emoji]:
+        payload = {
+            'name': name,
+            'image': image,
+        }
+
+        return self.request(
+            Route('POST', '/applications/{application_id}/emojis', application_id=application_id), json=payload
+        )
+
+    def edit_application_emoji(
+        self,
+        application_id: Snowflake,
+        emoji_id: Snowflake,
+        *,
+        payload: Dict[str, Any],
+    ) -> Response[emoji.Emoji]:
+        r = Route(
+            'PATCH', '/applications/{application_id}/emojis/{emoji_id}', application_id=application_id, emoji_id=emoji_id
+        )
+        return self.request(r, json=payload)
+
+    def delete_application_emoji(
+        self,
+        application_id: Snowflake,
+        emoji_id: Snowflake,
+    ) -> Response[None]:
+        return self.request(
+            Route(
+                'DELETE',
+                '/applications/{application_id}/emojis/{emoji_id}',
+                application_id=application_id,
+                emoji_id=emoji_id,
+            )
+        )
+
+    # Poll
+
+    def get_poll_answer_voters(
+        self,
+        channel_id: Snowflake,
+        message_id: Snowflake,
+        answer_id: Snowflake,
+        after: Optional[Snowflake] = None,
+        limit: Optional[int] = None,
+    ) -> Response[poll.PollAnswerVoters]:
+        params = {}
+
+        if after:
+            params['after'] = int(after)
+
+        if limit is not None:
+            params['limit'] = limit
+
+        return self.request(
+            Route(
+                'GET',
+                '/channels/{channel_id}/polls/{message_id}/answers/{answer_id}',
+                channel_id=channel_id,
+                message_id=message_id,
+                answer_id=answer_id,
+            ),
+            params=params,
+        )
+
+    def end_poll(self, channel_id: Snowflake, message_id: Snowflake) -> Response[message.Message]:
+        return self.request(
+            Route(
+                'POST',
+                '/channels/{channel_id}/polls/{message_id}/expire',
+                channel_id=channel_id,
+                message_id=message_id,
+            )
+        )
+
+    # Misc
 
     async def get_gateway(self, *, encoding: str = 'json', zlib: bool = True) -> str:
         try:
