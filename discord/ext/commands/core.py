@@ -2231,10 +2231,8 @@ def has_permissions(**perms: bool) -> Check[Any]:
 
         missing = [perm for perm, value in perms.items() if getattr(permissions, perm) != value]
 
-        if not missing:
-            return bot_has_permissions(*perms)
-
-        raise MissingPermissions(missing)
+        if missing:
+            raise MissingPermissions(missing)
 
     return check(predicate)
 
