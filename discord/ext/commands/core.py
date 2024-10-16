@@ -2188,7 +2188,7 @@ def bot_has_permissions(**perms: bool) -> Check[Any]:
         if not missing:
             return True
 
-        raise BotMissingPermissions(missing)
+        raise BotMissingPermissions(*missing)
 
     return check(predicate)
 
