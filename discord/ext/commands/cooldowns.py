@@ -173,36 +173,25 @@ class DynamicCooldownMapping(CooldownMapping[T_contra]):
 
 
 class _Semaphore:
-    """This class is a version of a semaphore.
-
-    If you're wondering why asyncio.Semaphore isn't being used,
-    it's because it doesn't expose the internal value. This internal
-    value is necessary because I need to support both `wait=True` and
-    `wait=False`.
-
-    An asyncio.Queue could have been used to do this as well -- but it is
-    not as inefficient since internally that uses two queues and is a bit
-    overkill for what is basically a counter.
-    """
-
-    __slots__ = ('value', 'loop', '_waiters')
+    __slots__ = ('value', 'loop', '_waiters', '_locked')
 
     def __init__(self, number: int) -> None:
         self.value: int = number
         self.loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
         self._waiters: Deque[asyncio.Future] = deque()
+        self._locked: bool = False
 
     def __repr__(self) -> str:
         return f'<_Semaphore value={self.value} waiters={len(self._waiters)}>'
 
     def locked(self) -> bool:
-        return self.value == 0
+        return self.value <= 0
 
     def is_active(self) -> bool:
         return len(self._waiters) > 0
 
     def wake_up(self) -> None:
-        while self._waiters:
+        while self._waiters and self.value > 0:
             future = self._waiters.popleft()
             if not future.done():
                 future.set_result(None)
@@ -210,24 +199,34 @@ class _Semaphore:
 
     async def acquire(self, *, wait: bool = False) -> bool:
         if not wait and self.value <= 0:
-            # signal that we're not acquiring
             return False
 
-        while self.value <= 0:
+        if self.value <= 0:
+            if not wait:
+                return False
+                
             future = self.loop.create_future()
             self._waiters.append(future)
+            
             try:
                 await future
-            except:
-                future.cancel()
+            except Exception:
+                try:
+                    self._waiters.remove(future)
+                except ValueError:
+                    pass
+                
                 if self.value > 0 and not future.cancelled():
                     self.wake_up()
                 raise
-
+        
         self.value -= 1
         return True
 
     def release(self) -> None:
+        if self.value < 0:
+            self.value = 0
+
         self.value += 1
         self.wake_up()
 
