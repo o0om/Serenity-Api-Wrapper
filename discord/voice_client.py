@@ -28,7 +28,7 @@ import asyncio
 import logging
 import struct
 import time
-from typing import Any, Callable, List, Optional, TYPE_CHECKING, Tuple, Union
+from typing import Any, Callable, List, Optional, TYPE_CHECKING, Tuple, Union, Dict
 
 from . import opus
 from .gateway import *
@@ -190,31 +190,7 @@ class VoiceProtocol:
 
 
 class VoiceClient(VoiceProtocol):
-    """Represents a Discord voice connection.
-
-    You do not create these, you typically get them from
-    e.g. :meth:`VoiceChannel.connect`.
-
-    Warning
-    --------
-    In order to use PCM based AudioSources, you must have the opus library
-    installed on your system and loaded through :func:`opus.load_opus`.
-    Otherwise, your AudioSources must be opus encoded (e.g. using :class:`FFmpegOpusAudio`)
-    or the library will not be able to transmit audio.
-
-    Attributes
-    -----------
-    session_id: :class:`str`
-        The voice connection session ID.
-    token: :class:`str`
-        The voice connection token.
-    endpoint: :class:`str`
-        The endpoint we are connecting to.
-    channel: Union[:class:`VoiceChannel`, :class:`StageChannel`]
-        The voice channel connected to.
-    """
-
-    channel: VocalGuildChannel
+    """Represents a Discord voice connection with enhanced reliability and monitoring."""
 
     def __init__(self, client: Client, channel: VocalGuildChannel) -> None:
         if not has_nacl:
@@ -241,6 +217,15 @@ class VoiceClient(VoiceProtocol):
         self._last_packet_time: float = 0.0
         self._packet_timeout: float = 5.0
         self._connection_check_task: Optional[asyncio.Task] = None
+        
+        # Performance monitoring
+        self._connection_stats = {
+            'total_packets': 0,
+            'failed_packets': 0,
+            'reconnects': 0,
+            'errors': 0,
+            'latency': []
+        }
 
     warn_nacl: bool = not has_nacl
     supported_modes: Tuple[SupportedModes, ...] = (
@@ -435,9 +420,12 @@ class VoiceClient(VoiceProtocol):
             await asyncio.sleep(delay)
             await self.connect(reconnect=True, timeout=30.0)
             self._reconnect_attempts = 0
+            self._connection_stats['reconnects'] += 1
             _log.info("Successfully reconnected to voice")
         except Exception as e:
             _log.error("Reconnection attempt failed: %s", e)
+            self._connection_stats['errors'] += 1
+            raise
 
     def _get_voice_packet(self, data: bytes) -> bytes:
         """Creates a voice packet with enhanced error handling."""
@@ -615,3 +603,25 @@ class VoiceClient(VoiceProtocol):
         except Exception as e:
             _log.error('Error sending audio packet: %s', e)
             raise
+
+    def get_connection_stats(self) -> Dict[str, Any]:
+        """Get detailed statistics about the voice connection."""
+        stats = self._connection_stats.copy()
+        if stats['latency']:
+            stats['average_latency'] = sum(stats['latency']) / len(stats['latency'])
+            stats['min_latency'] = min(stats['latency'])
+            stats['max_latency'] = max(stats['latency'])
+        return stats
+
+    def update_packet_stats(self, success: bool = True) -> None:
+        """Update packet statistics."""
+        self._last_packet_time = time.time()
+        self._connection_stats['total_packets'] += 1
+        if not success:
+            self._connection_stats['failed_packets'] += 1
+
+    def update_latency(self, latency: float) -> None:
+        """Update latency statistics."""
+        self._connection_stats['latency'].append(latency)
+        if len(self._connection_stats['latency']) > 20:  # Keep last 20 measurements
+            self._connection_stats['latency'].pop(0)
