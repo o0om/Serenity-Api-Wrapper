@@ -1,7 +1,7 @@
 """
 The MIT License (MIT)
 
-Copyright (c) 2015-present Rapptz
+Copyright (c) 2015-present Serenity
 
 Permission is hereby granted, free of charge, to any person obtaining a
 copy of this software and associated documentation files (the "Software"),
@@ -26,6 +26,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from typing import TYPE_CHECKING, Any, Callable, Tuple, Type, Optional, List, Dict, Set, Union
+from dataclasses import dataclass, field
 
 import aiohttp
 import yarl
@@ -40,11 +43,10 @@ from .errors import (
     GatewayNotFound,
     ConnectionClosed,
     PrivilegedIntentsRequired,
+    ShardError,
 )
-
 from .enums import Status
-
-from typing import TYPE_CHECKING, Any, Callable, Tuple, Type, Optional, List, Dict
+from .utils import MISSING
 
 if TYPE_CHECKING:
     from .gateway import DiscordWebSocket
@@ -54,12 +56,14 @@ if TYPE_CHECKING:
 __all__ = (
     'AutoShardedClient',
     'ShardInfo',
+    'ShardStats',
 )
 
 _log = logging.getLogger(__name__)
 
 
 class EventType:
+    """Event types for shard management."""
     close = 0
     reconnect = 1
     resume = 2
@@ -68,7 +72,68 @@ class EventType:
     clean_close = 5
 
 
+@dataclass
+class ShardStats:
+    """Statistics for a shard connection.
+    
+    Attributes
+    ----------
+    events_received: int
+        Number of events received by the shard.
+    events_sent: int
+        Number of events sent by the shard.
+    reconnects: int
+        Number of reconnection attempts.
+    latency: float
+        Current latency of the shard in seconds.
+    last_heartbeat: float
+        Timestamp of the last heartbeat.
+    last_heartbeat_ack: float
+        Timestamp of the last heartbeat acknowledgment.
+    """
+    events_received: int = 0
+    events_sent: int = 0
+    reconnects: int = 0
+    latency: float = 0.0
+    last_heartbeat: float = 0.0
+    last_heartbeat_ack: float = 0.0
+    _last_update: float = field(default_factory=time.time)
+    
+    def update_latency(self, latency: float) -> None:
+        """Updates the latency with exponential moving average.
+        
+        Parameters
+        ----------
+        latency: float
+            The new latency measurement.
+        """
+        alpha = 0.1  # Smoothing factor
+        self.latency = (alpha * latency) + ((1 - alpha) * self.latency)
+        self._last_update = time.time()
+    
+    def update_heartbeat(self) -> None:
+        """Updates the last heartbeat timestamp."""
+        self.last_heartbeat = time.time()
+    
+    def update_heartbeat_ack(self) -> None:
+        """Updates the last heartbeat acknowledgment timestamp."""
+        self.last_heartbeat_ack = time.time()
+        if self.last_heartbeat > 0:
+            self.update_latency(self.last_heartbeat_ack - self.last_heartbeat)
+
+
 class EventItem:
+    """Represents a shard event.
+    
+    Attributes
+    ----------
+    type: int
+        The type of event.
+    shard: Optional[Shard]
+        The shard associated with the event.
+    error: Optional[Exception]
+        Any error associated with the event.
+    """
     __slots__ = ('type', 'shard', 'error')
 
     def __init__(self, etype: int, shard: Optional['Shard'], error: Optional[Exception]) -> None:
@@ -91,6 +156,16 @@ class EventItem:
 
 
 class Shard:
+    """Represents a Discord shard connection.
+    
+    Attributes
+    ----------
+    ws: DiscordWebSocket
+        The websocket connection for this shard.
+    stats: ShardStats
+        Statistics for this shard.
+    """
+    
     def __init__(self, ws: DiscordWebSocket, client: AutoShardedClient, queue_put: Callable[[EventItem], None]) -> None:
         self.ws: DiscordWebSocket = ws
         self._client: Client = client
@@ -100,6 +175,7 @@ class Shard:
         self._reconnect = client._reconnect
         self._backoff: ExponentialBackoff = ExponentialBackoff()
         self._task: Optional[asyncio.Task] = None
+        self.stats: ShardStats = ShardStats()
         self._handled_exceptions: Tuple[Type[Exception], ...] = (
             OSError,
             HTTPException,
@@ -108,30 +184,61 @@ class Shard:
             aiohttp.ClientError,
             asyncio.TimeoutError,
         )
+        self._last_heartbeat: float = 0.0
+        self._heartbeat_timeout: float = 30.0
+        self._reconnect_timeout: float = 60.0
+        self._max_reconnects: int = 5
+        self._reconnect_count: int = 0
 
     @property
     def id(self) -> int:
-        # DiscordWebSocket.shard_id is set in the from_client classmethod
+        """The shard ID."""
         return self.ws.shard_id  # type: ignore
 
+    @property
+    def latency(self) -> float:
+        """The current latency of the shard in seconds."""
+        return self.stats.latency
+
+    @property
+    def is_healthy(self) -> bool:
+        """Whether the shard connection is healthy."""
+        if not self.ws.open:
+            return False
+        if time.time() - self._last_heartbeat > self._heartbeat_timeout:
+            return False
+        return True
+
     def launch(self) -> None:
+        """Launches the shard worker task."""
         self._task = self._client.loop.create_task(self.worker())
 
     def _cancel_task(self) -> None:
+        """Cancels the worker task if it exists."""
         if self._task is not None and not self._task.done():
             self._task.cancel()
 
     async def close(self) -> None:
+        """Closes the shard connection."""
         self._cancel_task()
         await self.ws.close(code=1000)
 
     async def disconnect(self) -> None:
+        """Disconnects the shard and dispatches the disconnect event."""
         await self.close()
         self._dispatch('shard_disconnect', self.id)
 
     async def _handle_disconnect(self, e: Exception) -> None:
+        """Handles a disconnection event.
+        
+        Parameters
+        ----------
+        e: Exception
+            The exception that caused the disconnection.
+        """
         self._dispatch('disconnect')
         self._dispatch('shard_disconnect', self.id)
+        
         if not self._reconnect:
             self._queue_put(EventItem(EventType.close, self, e))
             return
@@ -153,15 +260,23 @@ class Shard:
                 self._queue_put(EventItem(EventType.close, self, e))
                 return
 
+        self._reconnect_count += 1
+        if self._reconnect_count > self._max_reconnects:
+            self._queue_put(EventItem(EventType.terminate, self, ShardError(f"Max reconnects ({self._max_reconnects}) exceeded")))
+            return
+
         retry = self._backoff.delay()
-        _log.error('Attempting a reconnect for shard ID %s in %.2fs', self.id, retry, exc_info=e)
+        _log.error('Attempting a reconnect for shard ID %s in %.2fs (attempt %d/%d)', 
+                  self.id, retry, self._reconnect_count, self._max_reconnects, exc_info=e)
         await asyncio.sleep(retry)
         self._queue_put(EventItem(EventType.reconnect, self, e))
 
     async def worker(self) -> None:
+        """The main worker task for the shard."""
         while not self._client.is_closed():
             try:
                 await self.ws.poll_event()
+                self.stats.events_received += 1
             except ReconnectWebSocket as e:
                 etype = EventType.resume if e.resume else EventType.identify
                 self._queue_put(EventItem(etype, self, e))
@@ -176,10 +291,18 @@ class Shard:
                 break
 
     async def reidentify(self, exc: ReconnectWebSocket) -> None:
+        """Reidentifies the shard connection.
+        
+        Parameters
+        ----------
+        exc: ReconnectWebSocket
+            The reconnection exception.
+        """
         self._cancel_task()
         self._dispatch('disconnect')
         self._dispatch('shard_disconnect', self.id)
         _log.debug('Got a request to %s the websocket at Shard ID %s.', exc.op, self.id)
+        
         try:
             coro = DiscordWebSocket.from_client(
                 self._client,
@@ -189,7 +312,8 @@ class Shard:
                 session=self.ws.session_id,
                 sequence=self.ws.sequence,
             )
-            self.ws = await asyncio.wait_for(coro, timeout=60.0)
+            self.ws = await asyncio.wait_for(coro, timeout=self._reconnect_timeout)
+            self.stats.reconnects += 1
         except self._handled_exceptions as e:
             await self._handle_disconnect(e)
         except ReconnectWebSocket as e:
@@ -204,10 +328,12 @@ class Shard:
             self.launch()
 
     async def reconnect(self) -> None:
+        """Reconnects the shard."""
         self._cancel_task()
         try:
             coro = DiscordWebSocket.from_client(self._client, shard_id=self.id)
-            self.ws = await asyncio.wait_for(coro, timeout=60.0)
+            self.ws = await asyncio.wait_for(coro, timeout=self._reconnect_timeout)
+            self.stats.reconnects += 1
         except self._handled_exceptions as e:
             await self._handle_disconnect(e)
         except asyncio.CancelledError:
@@ -217,6 +343,15 @@ class Shard:
         else:
             self.launch()
 
+    def update_heartbeat(self) -> None:
+        """Updates the heartbeat timestamp."""
+        self._last_heartbeat = time.time()
+        self.stats.update_heartbeat()
+
+    def update_heartbeat_ack(self) -> None:
+        """Updates the heartbeat acknowledgment timestamp."""
+        self.stats.update_heartbeat_ack()
+
 
 class ShardInfo:
     """A class that gives information and control over a specific shard.
@@ -224,71 +359,66 @@ class ShardInfo:
     You can retrieve this object via :meth:`AutoShardedClient.get_shard`
     or :attr:`AutoShardedClient.shards`.
 
-    .. versionadded:: 1.4
-
     Attributes
     ------------
     id: :class:`int`
         The shard ID for this shard.
     shard_count: Optional[:class:`int`]
         The shard count for this cluster. If this is ``None`` then the bot has not started yet.
+    stats: :class:`ShardStats`
+        Statistics for this shard.
     """
 
-    __slots__ = ('_parent', 'id', 'shard_count')
+    __slots__ = ('_parent', 'id', 'shard_count', 'stats')
 
     def __init__(self, parent: Shard, shard_count: Optional[int]) -> None:
         self._parent: Shard = parent
         self.id: int = parent.id
         self.shard_count: Optional[int] = shard_count
+        self.stats: ShardStats = parent.stats
 
     def is_closed(self) -> bool:
         """:class:`bool`: Whether the shard connection is currently closed."""
         return not self._parent.ws.open
 
+    def is_healthy(self) -> bool:
+        """:class:`bool`: Whether the shard connection is healthy."""
+        return self._parent.is_healthy
+
+    @property
+    def latency(self) -> float:
+        """:class:`float`: The current latency of the shard in seconds."""
+        return self._parent.latency
+
     async def disconnect(self) -> None:
         """|coro|
 
-        Disconnects a shard. When this is called, the shard connection will no
+        Disconnects the shard. When this is called, the shard connection will no
         longer be open.
-
-        If the shard is already disconnected this does nothing.
         """
-        if self.is_closed():
-            return
-
         await self._parent.disconnect()
 
     async def reconnect(self) -> None:
         """|coro|
 
-        Disconnects and then connects the shard again.
+        Disconnects and then reconnects the shard.
         """
-        if not self.is_closed():
-            await self._parent.disconnect()
         await self._parent.reconnect()
 
     async def connect(self) -> None:
         """|coro|
 
-        Connects a shard. If the shard is already connected this does nothing.
+        Connects the shard. If the shard is already connected this does nothing.
         """
         if not self.is_closed():
             return
-
-        await self._parent.reconnect()
-
-    @property
-    def latency(self) -> float:
-        """:class:`float`: Measures latency between a HEARTBEAT and a HEARTBEAT_ACK in seconds for this shard."""
-        return self._parent.ws.latency
+        await self.reconnect()
 
     def is_ws_ratelimited(self) -> bool:
         """:class:`bool`: Whether the websocket is currently rate limited.
 
-        This can be useful to know when deciding whether you should query members
-        using HTTP or via the gateway.
-
-        .. versionadded:: 1.6
+        This can be useful to check when deciding whether you should query members
+        using HTTP or through the gateway instead.
         """
         return self._parent.ws.is_ratelimited()
 
