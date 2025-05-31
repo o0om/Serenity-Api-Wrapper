@@ -48,6 +48,7 @@ from typing import (
 )
 import weakref
 import inspect
+import time
 
 import os
 
@@ -204,6 +205,38 @@ class ConnectionState(Generic[ClientT]):
         if self.guild_ready_timeout < 0:
             raise ValueError('guild_ready_timeout cannot be negative')
 
+        # Enhanced state management
+        self._state_lock = asyncio.Lock()
+        self._state_ready = asyncio.Event()
+        self._state_error = None
+        self._state_retry_count = 0
+        self._max_state_retries = 3
+        self._state_retry_delay = 1.0
+        
+        # Performance monitoring
+        self._state_stats = {
+            'total_events': 0,
+            'failed_events': 0,
+            'state_changes': 0,
+            'reconnects': 0,
+            'latency': []
+        }
+        self._last_state_update = time.time()
+        self._state_update_interval = 60.0  # 1 minute
+        
+        # Event tracking
+        self._event_times = {}
+        self._event_counts = {}
+        self._event_errors = {}
+        
+        # Resource management
+        self._cleanup_tasks = set()
+        self._resource_limits = {
+            'max_guilds': options.get('max_guilds', 1000),
+            'max_channels': options.get('max_channels', 5000),
+            'max_members': options.get('max_members', 10000)
+        }
+
         allowed_mentions = options.get('allowed_mentions')
 
         if allowed_mentions is not None and not isinstance(allowed_mentions, AllowedMentions):
@@ -269,25 +302,114 @@ class ConnectionState(Generic[ClientT]):
 
         self.clear()
 
+    async def _handle_state_error(self, error: Exception) -> None:
+        """Handle state errors with retry logic."""
+        async with self._state_lock:
+            self._state_error = error
+            self._state_retry_count += 1
+            
+            if self._state_retry_count > self._max_state_retries:
+                _log.error("Max state retries exceeded: %s", error)
+                self._state_stats['failed_events'] += 1
+                raise error
+                
+            delay = self._state_retry_delay * (2 ** (self._state_retry_count - 1))
+            _log.warning("State error occurred, retrying in %.2f seconds: %s", delay, error)
+            await asyncio.sleep(delay)
+            
+            self._state_retry_count = 0
+            self._state_error = None
+
+    async def _update_state_stats(self) -> None:
+        """Update state statistics periodically."""
+        while True:
+            try:
+                current_time = time.time()
+                if current_time - self._last_state_update >= self._state_update_interval:
+                    self._state_stats['latency'].append(self.latency)
+                    if len(self._state_stats['latency']) > 100:  # Keep last 100 measurements
+                        self._state_stats['latency'].pop(0)
+                    self._last_state_update = current_time
+                await asyncio.sleep(1.0)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                _log.error("Error updating state stats: %s", e)
+
+    def _track_event(self, event_name: str) -> None:
+        """Track event timing and counts."""
+        current_time = time.time()
+        if event_name not in self._event_times:
+            self._event_times[event_name] = []
+            self._event_counts[event_name] = 0
+            self._event_errors[event_name] = 0
+            
+        self._event_times[event_name].append(current_time)
+        self._event_counts[event_name] += 1
+        
+        # Keep only last 1000 events
+        if len(self._event_times[event_name]) > 1000:
+            self._event_times[event_name].pop(0)
+
+    def _check_resource_limits(self) -> None:
+        """Check if we're approaching resource limits."""
+        guild_count = len(self._guilds)
+        channel_count = sum(len(g.channels) for g in self._guilds.values())
+        member_count = sum(len(g.members) for g in self._guilds.values())
+        
+        if guild_count > self._resource_limits['max_guilds'] * 0.9:
+            _log.warning("Approaching guild limit: %d/%d", guild_count, self._resource_limits['max_guilds'])
+        if channel_count > self._resource_limits['max_channels'] * 0.9:
+            _log.warning("Approaching channel limit: %d/%d", channel_count, self._resource_limits['max_channels'])
+        if member_count > self._resource_limits['max_members'] * 0.9:
+            _log.warning("Approaching member limit: %d/%d", member_count, self._resource_limits['max_members'])
+
+    async def close(self) -> None:
+        """Clean up resources and close connections."""
+        # Cancel all cleanup tasks
+        for task in self._cleanup_tasks:
+            task.cancel()
+        self._cleanup_tasks.clear()
+        
+        # Close voice connections
+        for voice in self.voice_clients:
+            try:
+                await voice.disconnect(force=True)
+            except Exception:
+                pass
+
+        if self._translator:
+            await self._translator.unload()
+
+    def get_state_stats(self) -> Dict[str, Any]:
+        """Get detailed statistics about the connection state."""
+        stats = self._state_stats.copy()
+        
+        # Add event statistics
+        stats['events'] = {
+            name: {
+                'count': self._event_counts.get(name, 0),
+                'errors': self._event_errors.get(name, 0),
+                'avg_time': sum(times) / len(times) if times else 0
+            }
+            for name, times in self._event_times.items()
+        }
+        
+        # Add resource usage
+        stats['resources'] = {
+            'guilds': len(self._guilds),
+            'channels': sum(len(g.channels) for g in self._guilds.values()),
+            'members': sum(len(g.members) for g in self._guilds.values())
+        }
+        
+        return stats
+
     # For some reason Discord still sends emoji/sticker data in payloads
     # This makes it hard to actually swap out the appropriate store methods
     # So this is checked instead, it's a small penalty to pay
     @property
     def cache_guild_expressions(self) -> bool:
         return self._intents.emojis_and_stickers
-
-    async def close(self) -> None:
-        for voice in self.voice_clients:
-            try:
-                await voice.disconnect(force=True)
-            except Exception:
-                # if an error happens during disconnects, disregard it.
-                pass
-
-        if self._translator:
-            await self._translator.unload()
-
-        # Purposefully don't call `clear` because users rely on cache being available post-close
 
     def clear(self, *, views: bool = True) -> None:
         self.user: Optional[ClientUser] = None
@@ -1353,14 +1475,13 @@ class ConnectionState(Generic[ClientT]):
 
     def parse_guild_role_create(self, data: gw.GuildRoleCreateEvent) -> None:
         guild = self._get_guild(int(data['guild_id']))
-        if guild is None:
+        if guild is not None:
+            role_data = data['role']
+            role = Role(guild=guild, data=role_data, state=self)
+            guild._add_role(role)
+            self.dispatch('guild_role_create', role)
+        else:
             _log.debug('GUILD_ROLE_CREATE referencing an unknown guild ID: %s. Discarding.', data['guild_id'])
-            return
-
-        role_data = data['role']
-        role = Role(guild=guild, data=role_data, state=self)
-        guild._add_role(role)
-        self.dispatch('guild_role_create', role)
 
     def parse_guild_role_delete(self, data: gw.GuildRoleDeleteEvent) -> None:
         guild = self._get_guild(int(data['guild_id']))
