@@ -24,8 +24,9 @@ DEALINGS IN THE SOFTWARE.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, TYPE_CHECKING, Union
+from typing import Any, Dict, Optional, TYPE_CHECKING, Union, ClassVar, Set, Tuple
 import re
+from weakref import WeakValueDictionary
 
 from .asset import Asset, AssetMixin
 from . import utils
@@ -44,6 +45,8 @@ if TYPE_CHECKING:
     from .types.emoji import Emoji as EmojiPayload, PartialEmoji as PartialEmojiPayload
     from .types.activity import ActivityEmoji
 
+# Cache for frequently used emoji combinations
+_EMOJI_CACHE: WeakValueDictionary[Tuple[bool, str, Optional[int]], 'PartialEmoji'] = WeakValueDictionary()
 
 class _EmojiTag:
     __slots__ = ()
@@ -61,6 +64,11 @@ class PartialEmoji(_EmojiTag, AssetMixin):
 
     - "Raw" data events such as :func:`on_raw_reaction_add`
     - Custom emoji that the bot cannot see from e.g. :attr:`Message.reactions`
+
+    .. versionchanged:: 2.5
+        Added caching for frequently used emoji combinations.
+        Added new utility methods for common emoji operations.
+        Enhanced type safety with better type hints.
 
     .. container:: operations
 
@@ -94,7 +102,8 @@ class PartialEmoji(_EmojiTag, AssetMixin):
 
     __slots__ = ('animated', 'name', 'id', '_state')
 
-    _CUSTOM_EMOJI_RE = re.compile(r'<?(?:(?P<animated>a)?:)?(?P<name>[A-Za-z0-9\_]+):(?P<id>[0-9]{13,20})>?')
+    _CUSTOM_EMOJI_RE: ClassVar[re.Pattern] = re.compile(r'<?(?:(?P<animated>a)?:)?(?P<name>[A-Za-z0-9\_]+):(?P<id>[0-9]{13,20})>?')
+    _VALID_EMOJI_NAME_RE: ClassVar[re.Pattern] = re.compile(r'^[A-Za-z0-9\_]+$')
 
     if TYPE_CHECKING:
         id: Optional[int]
@@ -105,8 +114,37 @@ class PartialEmoji(_EmojiTag, AssetMixin):
         self.id: Optional[int] = id
         self._state: Optional[ConnectionState] = None
 
+    def __new__(cls, *, name: str, animated: bool = False, id: Optional[int] = None) -> 'PartialEmoji':
+        # Check cache for frequently used emoji combinations
+        cache_key = (animated, name, id)
+        if cache_key in _EMOJI_CACHE:
+            return _EMOJI_CACHE[cache_key]
+        
+        instance = super().__new__(cls)
+        instance.animated = animated
+        instance.name = name
+        instance.id = id
+        instance._state = None
+        
+        # Cache the instance
+        _EMOJI_CACHE[cache_key] = instance
+        
+        return instance
+
     @classmethod
     def from_dict(cls, data: Union[PartialEmojiPayload, ActivityEmoji, Dict[str, Any]]) -> Self:
+        """Creates a :class:`PartialEmoji` from a dictionary.
+
+        Parameters
+        -----------
+        data: Union[:class:`PartialEmojiPayload`, :class:`ActivityEmoji`, Dict[:class:`str`, Any]]
+            The dictionary to create the emoji from.
+
+        Returns
+        --------
+        :class:`PartialEmoji`
+            The created partial emoji.
+        """
         return cls(
             animated=data.get('animated', False),
             id=utils._get_as_snowflake(data, 'id'),
@@ -137,6 +175,11 @@ class PartialEmoji(_EmojiTag, AssetMixin):
         --------
         :class:`PartialEmoji`
             The partial emoji from this string.
+
+        Raises
+        -------
+        ValueError
+            If the emoji name is invalid.
         """
         match = cls._CUSTOM_EMOJI_RE.match(value)
         if match is not None:
@@ -144,11 +187,23 @@ class PartialEmoji(_EmojiTag, AssetMixin):
             animated = bool(groups['animated'])
             emoji_id = int(groups['id'])
             name = groups['name']
+            
+            # Validate emoji name
+            if not cls._VALID_EMOJI_NAME_RE.match(name):
+                raise ValueError(f'Invalid emoji name: {name}')
+                
             return cls(name=name, animated=animated, id=emoji_id)
 
         return cls(name=value, id=None, animated=False)
 
     def to_dict(self) -> EmojiPayload:
+        """Converts the emoji to a dictionary.
+
+        Returns
+        --------
+        :class:`EmojiPayload`
+            The dictionary representation of the emoji.
+        """
         payload: EmojiPayload = {
             'id': self.id,
             'name': self.name,
@@ -176,6 +231,24 @@ class PartialEmoji(_EmojiTag, AssetMixin):
         animated: bool = False,
         id: Optional[int] = None,
     ) -> Self:
+        """Creates a :class:`PartialEmoji` with a state.
+
+        Parameters
+        -----------
+        state: :class:`ConnectionState`
+            The state to use.
+        name: :class:`str`
+            The name of the emoji.
+        animated: :class:`bool`
+            Whether the emoji is animated.
+        id: Optional[:class:`int`]
+            The ID of the emoji.
+
+        Returns
+        --------
+        :class:`PartialEmoji`
+            The created partial emoji.
+        """
         self = cls(name=name, animated=animated, id=id)
         self._state = state
         return self
@@ -267,3 +340,39 @@ class PartialEmoji(_EmojiTag, AssetMixin):
             raise ValueError('PartialEmoji is not a custom emoji')
 
         return await super().read()
+
+    def validate(self) -> bool:
+        """Validates the emoji.
+
+        Returns
+        --------
+        :class:`bool`
+            Whether the emoji is valid.
+        """
+        if self.is_unicode_emoji():
+            return bool(self.name)
+        return bool(self.name and self.id and self._VALID_EMOJI_NAME_RE.match(self.name))
+
+    def to_unicode(self) -> str:
+        """Converts the emoji to a Unicode representation.
+
+        Returns
+        --------
+        :class:`str`
+            The Unicode representation of the emoji.
+        """
+        if self.is_unicode_emoji():
+            return self.name
+        return str(self)
+
+    def to_custom_emoji(self) -> Optional['PartialEmoji']:
+        """Converts the emoji to a custom emoji if possible.
+
+        Returns
+        --------
+        Optional[:class:`PartialEmoji`]
+            The custom emoji representation, or None if not possible.
+        """
+        if self.is_custom_emoji():
+            return self
+        return None
