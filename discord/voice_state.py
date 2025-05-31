@@ -44,6 +44,7 @@ import socket
 import asyncio
 import logging
 import threading
+import time
 
 from typing import TYPE_CHECKING, Optional, Dict, List, Callable, Coroutine, Any, Tuple
 
@@ -209,6 +210,7 @@ class VoiceConnectionState:
         self.socket: socket.socket = MISSING
         self.ws: DiscordVoiceWebSocket = MISSING
 
+        # Enhanced state management
         self._state: ConnectionFlowState = ConnectionFlowState.disconnected
         self._expecting_disconnect: bool = False
         self._connected = threading.Event()
@@ -218,6 +220,14 @@ class VoiceConnectionState:
         self._connector: Optional[asyncio.Task] = None
         self._socket_reader = SocketReader(self)
         self._socket_reader.start()
+        
+        # Connection health monitoring
+        self._last_heartbeat: float = 0.0
+        self._heartbeat_timeout: float = 10.0
+        self._connection_errors: int = 0
+        self._max_connection_errors: int = 3
+        self._error_reset_time: float = 60.0
+        self._last_error_time: float = 0.0
 
     @property
     def state(self) -> ConnectionFlowState:
@@ -363,6 +373,10 @@ class VoiceConnectionState:
     async def connect(
         self, *, reconnect: bool, timeout: float, self_deaf: bool, self_mute: bool, resume: bool, wait: bool = True
     ) -> None:
+        """|coro|
+
+        Connects to voice with enhanced error handling and health monitoring.
+        """
         if self._connector:
             self._connector.cancel()
             self._connector = None
@@ -376,10 +390,17 @@ class VoiceConnectionState:
         self._connector = self.voice_client.loop.create_task(
             self._wrap_connect(reconnect, timeout, self_deaf, self_mute, resume), name='Voice connector'
         )
+        
+        # Start connection health monitoring
+        self._health_check_task = self.voice_client.loop.create_task(
+            self._check_connection_health(), name='Voice health check'
+        )
+        
         if wait:
             await self._connector
 
     async def _wrap_connect(self, *args: Any) -> None:
+        """Wraps connection with enhanced error handling."""
         try:
             await self._connect(*args)
         except asyncio.CancelledError:
@@ -388,11 +409,11 @@ class VoiceConnectionState:
             raise
         except asyncio.TimeoutError:
             _log.info('Timed out connecting to voice')
-            await self.disconnect()
+            await self._handle_connection_error(ConnectionClosed(1000, "Connection timeout"))
             raise
-        except Exception:
+        except Exception as e:
             _log.exception('Error connecting to voice... disconnecting')
-            await self.disconnect()
+            await self._handle_connection_error(e)
             raise
 
     async def _inner_connect(self, reconnect: bool, self_deaf: bool, self_mute: bool, resume: bool) -> None:
@@ -436,25 +457,38 @@ class VoiceConnectionState:
             self._runner = self.voice_client.loop.create_task(self._poll_voice_ws(reconnect), name='Voice websocket poller')
 
     async def disconnect(self, *, force: bool = True, cleanup: bool = True, wait: bool = False) -> None:
+        """|coro|
+
+        Disconnects from voice with proper cleanup and error handling.
+        """
         if not force and not self.is_connected():
             return
 
         try:
+            # Cancel health check task
+            if hasattr(self, '_health_check_task'):
+                self._health_check_task.cancel()
+                self._health_check_task = None
+
             await self._voice_disconnect()
             if self.ws:
                 await self.ws.close()
-        except Exception:
-            _log.debug('Ignoring exception disconnecting from voice', exc_info=True)
+                
+            # Reset error tracking
+            self._connection_errors = 0
+            self._last_error_time = 0.0
+            self._last_heartbeat = 0.0
+                
+        except Exception as e:
+            _log.error("Error during disconnect: %s", e)
         finally:
             self.state = ConnectionFlowState.disconnected
             self._socket_reader.pause()
 
-            # Stop threads before we unlock waiters so they end properly
             if cleanup:
                 self._socket_reader.stop()
                 self.voice_client.stop()
 
-            # Flip the connected event to unlock any waiters
             self._connected.set()
             self._connected.clear()
 
@@ -464,12 +498,7 @@ class VoiceConnectionState:
             self.ip = MISSING
             self.port = MISSING
 
-            # Skip this part if disconnect was called from the poll loop task
             if wait and not self._inside_runner():
-                # Wait for the voice_state_update event confirming the bot left the voice channel.
-                # This prevents a race condition caused by disconnecting and immediately connecting again.
-                # The new VoiceConnectionState object receives the voice_state_update event containing channel=None while still
-                # connecting leaving it in a bad state.  Since there's no nice way to transfer state to the new one, we have to do this.
                 try:
                     await asyncio.wait_for(self._disconnected.wait(), timeout=self.timeout)
                 except TimeoutError:
@@ -686,3 +715,41 @@ class VoiceConnectionState:
 
     def _update_voice_channel(self, channel_id: Optional[int]) -> None:
         self.voice_client.channel = channel_id and self.guild.get_channel(channel_id)  # type: ignore
+
+    async def _handle_connection_error(self, error: Exception) -> None:
+        """Handles connection errors with exponential backoff and error tracking."""
+        current_time = time.time()
+        
+        # Reset error count if enough time has passed
+        if current_time - self._last_error_time > self._error_reset_time:
+            self._connection_errors = 0
+            
+        self._connection_errors += 1
+        self._last_error_time = current_time
+        
+        if self._connection_errors >= self._max_connection_errors:
+            _log.error("Too many connection errors, disconnecting")
+            await self.disconnect(force=True)
+            return
+            
+        delay = min(2 ** self._connection_errors, 30)  # Cap at 30 seconds
+        _log.warning("Connection error occurred, retrying in %d seconds: %s", delay, error)
+        await asyncio.sleep(delay)
+
+    async def _check_connection_health(self) -> None:
+        """Monitors connection health and handles timeouts."""
+        while True:
+            try:
+                current_time = time.time()
+                if current_time - self._last_heartbeat > self._heartbeat_timeout:
+                    _log.warning("Voice connection heartbeat timeout")
+                    await self._handle_connection_error(ConnectionClosed(1000, "Heartbeat timeout"))
+                await asyncio.sleep(1.0)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                _log.error("Error in connection health check: %s", e)
+
+    def update_heartbeat(self) -> None:
+        """Updates the last heartbeat timestamp."""
+        self._last_heartbeat = time.time()
