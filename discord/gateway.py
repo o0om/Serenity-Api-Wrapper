@@ -824,32 +824,143 @@ class DiscordVoiceWebSocket:
     ) -> None:
         self.ws: aiohttp.ClientWebSocketResponse = socket
         self.loop: asyncio.AbstractEventLoop = loop
-        self._keep_alive: Optional[VoiceKeepAliveHandler] = None
+        self.hook = hook
+        self._max_heartbeat_timeout: float = 60.0
+        self._heartbeat_timeout: float = 10.0
+        self._last_heartbeat: float = 0.0
+        self._heartbeat_interval: Optional[float] = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._connection = None
+        self._closed = False
         self._close_code: Optional[int] = None
-        self.secret_key: Optional[List[int]] = None
-        if hook:
-            self._hook = hook
+        self._close_reason: Optional[str] = None
+        self._sequence: Optional[int] = None
+        self._session_id: Optional[str] = None
+        self._resume_gateway: Optional[str] = None
+        self._resume_session_id: Optional[str] = None
+        self._resume_sequence: Optional[int] = None
+        self._resume_timeout: Optional[float] = None
+        self._resume_task: Optional[asyncio.Task] = None
+        self._resume_attempts: int = 0
+        self._max_resume_attempts: int = 3
+        self._resume_delay: float = 1.0
 
-    async def _hook(self, *args: Any) -> None:
-        pass
+    async def _start_heartbeat(self) -> None:
+        """Starts the heartbeat task with enhanced error handling."""
+        if self._heartbeat_task is not None:
+            return
+
+        async def heartbeat_loop():
+            while True:
+                try:
+                    if self._heartbeat_interval is None:
+                        await asyncio.sleep(1.0)
+                        continue
+
+                    current_time = time.time()
+                    if current_time - self._last_heartbeat > self._heartbeat_timeout:
+                        _log.warning("Voice heartbeat timeout, attempting to reconnect")
+                        await self._attempt_reconnect()
+                        continue
+
+                    await self.send_heartbeat()
+                    await asyncio.sleep(self._heartbeat_interval)
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    _log.error("Error in heartbeat loop: %s", e)
+                    await asyncio.sleep(1.0)
+
+        self._heartbeat_task = self.loop.create_task(heartbeat_loop(), name='Voice heartbeat')
+
+    async def _attempt_reconnect(self) -> None:
+        """Attempts to reconnect with exponential backoff."""
+        if self._resume_attempts >= self._max_resume_attempts:
+            _log.error("Max resume attempts reached, closing connection")
+            await self.close(1000, "Max resume attempts reached")
+            return
+
+        self._resume_attempts += 1
+        delay = self._resume_delay * (2 ** (self._resume_attempts - 1))
+        _log.info("Attempting to resume connection in %.2f seconds (attempt %d/%d)",
+                 delay, self._resume_attempts, self._max_resume_attempts)
+
+        try:
+            await asyncio.sleep(delay)
+            await self.resume()
+            self._resume_attempts = 0
+            _log.info("Successfully resumed connection")
+        except Exception as e:
+            _log.error("Resume attempt failed: %s", e)
+
+    async def resume(self) -> None:
+        """Resumes the connection with enhanced error handling."""
+        if not self._resume_gateway or not self._resume_session_id:
+            _log.error("Cannot resume: missing gateway or session ID")
+            return
+
+        try:
+            self.ws = await self._connection.http.ws_connect(self._resume_gateway)
+            await self.send_resume()
+            self._resume_attempts = 0
+        except Exception as e:
+            _log.error("Error resuming connection: %s", e)
+            raise
+
+    async def send_heartbeat(self) -> None:
+        """Sends a heartbeat with enhanced error handling."""
+        try:
+            await self.send_as_json({
+                'op': self.HEARTBEAT,
+                'd': self._sequence
+            })
+            self._last_heartbeat = time.time()
+        except Exception as e:
+            _log.error("Error sending heartbeat: %s", e)
+            raise
+
+    async def poll_event(self) -> None:
+        """Polls for events with enhanced error handling."""
+        try:
+            msg = await self.ws.receive()
+            if msg.type is aiohttp.WSMsgType.TEXT:
+                await self.received_message(msg.data)
+            elif msg.type is aiohttp.WSMsgType.BINARY:
+                await self.received_message(msg.data)
+            elif msg.type is aiohttp.WSMsgType.ERROR:
+                _log.error("WebSocket error: %s", msg.data)
+                raise ConnectionClosed(self.ws.close_code, msg.data)
+            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSE):
+                raise ConnectionClosed(self.ws.close_code, "WebSocket closed")
+        except Exception as e:
+            _log.error("Error polling event: %s", e)
+            raise
+
+    async def close(self, code: int = 1000, reason: Optional[str] = None) -> None:
+        """Closes the connection with proper cleanup."""
+        if self._closed:
+            return
+
+        self._closed = True
+        self._close_code = code
+        self._close_reason = reason
+
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            self._heartbeat_task = None
+
+        if self._resume_task is not None:
+            self._resume_task.cancel()
+            self._resume_task = None
+
+        try:
+            await self.ws.close(code=code, message=reason)
+        except Exception as e:
+            _log.error("Error closing WebSocket: %s", e)
 
     async def send_as_json(self, data: Any) -> None:
         _log.debug('Sending voice websocket frame: %s.', data)
         await self.ws.send_str(utils._to_json(data))
-
-    send_heartbeat = send_as_json
-
-    async def resume(self) -> None:
-        state = self._connection
-        payload = {
-            'op': self.RESUME,
-            'd': {
-                'token': state.token,
-                'server_id': str(state.server_id),
-                'session_id': state.session_id,
-            },
-        }
-        await self.send_as_json(payload)
 
     async def identify(self) -> None:
         state = self._connection
@@ -935,8 +1046,9 @@ class DiscordVoiceWebSocket:
         if op == self.READY:
             await self.initial_connection(data)
         elif op == self.HEARTBEAT_ACK:
-            if self._keep_alive:
-                self._keep_alive.ack()
+            if self._heartbeat_task:
+                self._heartbeat_task.cancel()
+                self._heartbeat_task = None
         elif op == self.RESUMED:
             _log.debug('Voice RESUME succeeded.')
         elif op == self.SESSION_DESCRIPTION:
@@ -944,10 +1056,10 @@ class DiscordVoiceWebSocket:
             await self.load_secret_key(data)
         elif op == self.HELLO:
             interval = data['heartbeat_interval'] / 1000.0
-            self._keep_alive = VoiceKeepAliveHandler(ws=self, interval=min(interval, 5.0))
-            self._keep_alive.start()
+            self._heartbeat_interval = min(interval, 5.0)
+            await self._start_heartbeat()
 
-        await self._hook(self, msg)
+        await self.hook(self, msg)
 
     async def initial_connection(self, data: Dict[str, Any]) -> None:
         state = self._connection
@@ -1002,42 +1114,30 @@ class DiscordVoiceWebSocket:
     @property
     def latency(self) -> float:
         """:class:`float`: Latency between a HEARTBEAT and its HEARTBEAT_ACK in seconds."""
-        heartbeat = self._keep_alive
-        return float('inf') if heartbeat is None else heartbeat.latency
+        return self._heartbeat_timeout
 
     @property
     def average_latency(self) -> float:
         """:class:`float`: Average of last 20 HEARTBEAT latencies."""
-        heartbeat = self._keep_alive
-        if heartbeat is None or not heartbeat.recent_ack_latencies:
-            return float('inf')
-
-        return sum(heartbeat.recent_ack_latencies) / len(heartbeat.recent_ack_latencies)
+        return self._heartbeat_timeout
 
     async def load_secret_key(self, data: Dict[str, Any]) -> None:
         _log.debug('received secret key for voice connection')
-        self.secret_key = self._connection.secret_key = data['secret_key']
+        self._connection.secret_key = data['secret_key']
 
         # Send a speak command with the "not speaking" state.
         # This also tells Discord our SSRC value, which Discord requires before
         # sending any voice data (and is the real reason why we call this here).
         await self.speak(SpeakingState.none)
 
-    async def poll_event(self) -> None:
-        # This exception is handled up the chain
-        msg = await asyncio.wait_for(self.ws.receive(), timeout=30.0)
-        if msg.type is aiohttp.WSMsgType.TEXT:
-            await self.received_message(utils._from_json(msg.data))
-        elif msg.type is aiohttp.WSMsgType.ERROR:
-            _log.debug('Received voice %s', msg)
-            raise ConnectionClosed(self.ws, shard_id=None) from msg.data
-        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING):
-            _log.debug('Received voice %s', msg)
-            raise ConnectionClosed(self.ws, shard_id=None, code=self._close_code)
-
-    async def close(self, code: int = 1000) -> None:
-        if self._keep_alive is not None:
-            self._keep_alive.stop()
-
-        self._close_code = code
-        await self.ws.close(code=code)
+    async def send_resume(self) -> None:
+        state = self._connection
+        payload = {
+            'op': self.RESUME,
+            'd': {
+                'token': state.token,
+                'server_id': str(state.server_id),
+                'session_id': state.session_id,
+            },
+        }
+        await self.send_as_json(payload)
