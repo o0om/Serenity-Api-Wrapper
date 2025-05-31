@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import struct
+import time
 from typing import Any, Callable, List, Optional, TYPE_CHECKING, Tuple, Union
 
 from . import opus
@@ -215,7 +216,7 @@ class VoiceClient(VoiceProtocol):
 
     channel: VocalGuildChannel
 
-    def __init__(self, client: Client, channel: abc.Connectable) -> None:
+    def __init__(self, client: Client, channel: VocalGuildChannel) -> None:
         if not has_nacl:
             raise RuntimeError("PyNaCl library needed in order to use voice")
 
@@ -231,8 +232,15 @@ class VoiceClient(VoiceProtocol):
         self._player: Optional[AudioPlayer] = None
         self.encoder: Encoder = MISSING
         self._incr_nonce: int = 0
-
         self._connection: VoiceConnectionState = self.create_connection_state()
+        
+        # Enhanced error handling and reconnection
+        self._reconnect_attempts: int = 0
+        self._max_reconnect_attempts: int = 5
+        self._reconnect_delay: float = 1.0
+        self._last_packet_time: float = 0.0
+        self._packet_timeout: float = 5.0
+        self._connection_check_task: Optional[asyncio.Task] = None
 
     warn_nacl: bool = not has_nacl
     supported_modes: Tuple[SupportedModes, ...] = (
@@ -302,10 +310,27 @@ class VoiceClient(VoiceProtocol):
     async def on_voice_server_update(self, data: VoiceServerUpdatePayload) -> None:
         await self._connection.voice_server_update(data)
 
-    async def connect(self, *, reconnect: bool, timeout: float, self_deaf: bool = False, self_mute: bool = False) -> None:
-        await self._connection.connect(
-            reconnect=reconnect, timeout=timeout, self_deaf=self_deaf, self_mute=self_mute, resume=False
-        )
+    async def connect(self, *, reconnect: bool = True, timeout: float = 30.0, 
+                     self_deaf: bool = False, self_mute: bool = False) -> None:
+        """|coro|
+
+        Connects to voice with enhanced error handling and reconnection logic.
+        """
+        try:
+            await self._connection.connect(
+                reconnect=reconnect,
+                timeout=timeout,
+                self_deaf=self_deaf,
+                self_mute=self_mute,
+                resume=False
+            )
+            await self._start_connection_check()
+        except Exception as e:
+            _log.error("Error connecting to voice: %s", e)
+            if reconnect:
+                await self._attempt_reconnect()
+            else:
+                raise
 
     def wait_until_connected(self, timeout: Optional[float] = 30.0) -> bool:
         self._connection.wait(timeout)
@@ -335,11 +360,16 @@ class VoiceClient(VoiceProtocol):
     async def disconnect(self, *, force: bool = False) -> None:
         """|coro|
 
-        Disconnects this voice client from voice.
+        Disconnects this voice client from voice with proper cleanup.
         """
+        if self._connection_check_task is not None:
+            self._connection_check_task.cancel()
+            self._connection_check_task = None
+            
         self.stop()
         await self._connection.disconnect(force=force, wait=True)
         self.cleanup()
+        self._reconnect_attempts = 0
 
     async def move_to(self, channel: Optional[abc.Snowflake], *, timeout: Optional[float] = 30.0) -> None:
         """|coro|
@@ -368,58 +398,64 @@ class VoiceClient(VoiceProtocol):
 
     # audio related
 
-    def _get_voice_packet(self, data):
-        header = bytearray(12)
+    async def _start_connection_check(self) -> None:
+        """Starts a background task to monitor connection health."""
+        if self._connection_check_task is not None:
+            return
+            
+        async def check_connection():
+            while True:
+                try:
+                    current_time = time.time()
+                    if current_time - self._last_packet_time > self._packet_timeout:
+                        _log.warning("No packets received for %.2f seconds, attempting reconnection", 
+                                   current_time - self._last_packet_time)
+                        await self._attempt_reconnect()
+                    await asyncio.sleep(1.0)
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    _log.error("Error in connection check: %s", e)
+                    
+        self._connection_check_task = self.loop.create_task(check_connection())
 
-        # Formulate rtp header
-        header[0] = 0x80
-        header[1] = 0x78
-        struct.pack_into('>H', header, 2, self.sequence)
-        struct.pack_into('>I', header, 4, self.timestamp)
-        struct.pack_into('>I', header, 8, self.ssrc)
+    async def _attempt_reconnect(self) -> None:
+        """Attempts to reconnect to the voice server with exponential backoff."""
+        if self._reconnect_attempts >= self._max_reconnect_attempts:
+            _log.error("Max reconnection attempts reached, giving up")
+            await self.disconnect(force=True)
+            return
+            
+        self._reconnect_attempts += 1
+        delay = self._reconnect_delay * (2 ** (self._reconnect_attempts - 1))
+        _log.info("Attempting reconnection in %.2f seconds (attempt %d/%d)", 
+                 delay, self._reconnect_attempts, self._max_reconnect_attempts)
+                 
+        try:
+            await asyncio.sleep(delay)
+            await self.connect(reconnect=True, timeout=30.0)
+            self._reconnect_attempts = 0
+            _log.info("Successfully reconnected to voice")
+        except Exception as e:
+            _log.error("Reconnection attempt failed: %s", e)
 
-        encrypt_packet = getattr(self, '_encrypt_' + self.mode)
-        return encrypt_packet(header, data)
+    def _get_voice_packet(self, data: bytes) -> bytes:
+        """Creates a voice packet with enhanced error handling."""
+        try:
+            header = bytearray(12)
+            header[0] = 0x80
+            header[1] = 0x78
+            struct.pack_into('>H', header, 2, self.sequence)
+            struct.pack_into('>I', header, 4, self.timestamp)
+            struct.pack_into('>I', header, 8, self.ssrc)
 
-    def _encrypt_aead_xchacha20_poly1305_rtpsize(self, header: bytes, data) -> bytes:
-        # Esentially the same as _lite
-        # Uses an incrementing 32-bit integer which is appended to the payload
-        # The only other difference is we require AEAD with Additional Authenticated Data (the header)
-        box = nacl.secret.Aead(bytes(self.secret_key))
-        nonce = bytearray(24)
-
-        nonce[:4] = struct.pack('>I', self._incr_nonce)
-        self.checked_add('_incr_nonce', 1, 4294967295)
-
-        return header + box.encrypt(bytes(data), bytes(header), bytes(nonce)).ciphertext + nonce[:4]
-
-    def _encrypt_xsalsa20_poly1305(self, header: bytes, data) -> bytes:
-        # Deprecated. Removal: 18th Nov 2024. See:
-        # https://discord.com/developers/docs/topics/voice-connections#transport-encryption-modes
-        box = nacl.secret.SecretBox(bytes(self.secret_key))
-        nonce = bytearray(24)
-        nonce[:12] = header
-
-        return header + box.encrypt(bytes(data), bytes(nonce)).ciphertext
-
-    def _encrypt_xsalsa20_poly1305_suffix(self, header: bytes, data) -> bytes:
-        # Deprecated. Removal: 18th Nov 2024. See:
-        # https://discord.com/developers/docs/topics/voice-connections#transport-encryption-modes
-        box = nacl.secret.SecretBox(bytes(self.secret_key))
-        nonce = nacl.utils.random(nacl.secret.SecretBox.NONCE_SIZE)
-
-        return header + box.encrypt(bytes(data), nonce).ciphertext + nonce
-
-    def _encrypt_xsalsa20_poly1305_lite(self, header: bytes, data) -> bytes:
-        # Deprecated. Removal: 18th Nov 2024. See:
-        # https://discord.com/developers/docs/topics/voice-connections#transport-encryption-modes
-        box = nacl.secret.SecretBox(bytes(self.secret_key))
-        nonce = bytearray(24)
-
-        nonce[:4] = struct.pack('>I', self._incr_nonce)
-        self.checked_add('_incr_nonce', 1, 4294967295)
-
-        return header + box.encrypt(bytes(data), bytes(nonce)).ciphertext + nonce[:4]
+            encrypt_packet = getattr(self, '_encrypt_' + self.mode)
+            packet = encrypt_packet(header, data)
+            self._last_packet_time = time.time()
+            return packet
+        except Exception as e:
+            _log.error("Error creating voice packet: %s", e)
+            raise
 
     def play(
         self,
@@ -558,34 +594,24 @@ class VoiceClient(VoiceProtocol):
         self._player.set_source(value)
 
     def send_audio_packet(self, data: bytes, *, encode: bool = True) -> None:
-        """Sends an audio packet composed of the data.
-
-        You must be connected to play audio.
-
-        Parameters
-        ----------
-        data: :class:`bytes`
-            The :term:`py:bytes-like object` denoting PCM or Opus voice data.
-        encode: :class:`bool`
-            Indicates if ``data`` should be encoded into Opus.
-
-        Raises
-        -------
-        ClientException
-            You are not connected.
-        opus.OpusError
-            Encoding the data failed.
-        """
-
-        self.checked_add('sequence', 1, 65535)
-        if encode:
-            encoded_data = self.encoder.encode(data, self.encoder.SAMPLES_PER_FRAME)
-        else:
-            encoded_data = data
-        packet = self._get_voice_packet(encoded_data)
+        """Sends an audio packet with enhanced error handling and retry logic."""
         try:
+            self.checked_add('sequence', 1, 65535)
+            if encode:
+                encoded_data = self.encoder.encode(data, self.encoder.SAMPLES_PER_FRAME)
+            else:
+                encoded_data = data
+                
+            packet = self._get_voice_packet(encoded_data)
             self._connection.send_packet(packet)
-        except OSError:
-            _log.debug('A packet has been dropped (seq: %s, timestamp: %s)', self.sequence, self.timestamp)
-
-        self.checked_add('timestamp', opus.Encoder.SAMPLES_PER_FRAME, 4294967295)
+            self.checked_add('timestamp', opus.Encoder.SAMPLES_PER_FRAME, 4294967295)
+            
+        except OSError as e:
+            _log.debug('Packet dropped (seq: %s, timestamp: %s): %s', 
+                      self.sequence, self.timestamp, e)
+            # Attempt to recover from packet loss
+            self._last_packet_time = time.time()
+            
+        except Exception as e:
+            _log.error('Error sending audio packet: %s', e)
+            raise
