@@ -24,14 +24,16 @@ DEALINGS IN THE SOFTWARE.
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Iterable, List, Literal, Optional, Sequence, Union, TYPE_CHECKING
+from typing import Callable, Dict, Iterable, List, Literal, Optional, Sequence, Union, TYPE_CHECKING, Set
 from datetime import datetime
 import array
+import time
+from dataclasses import dataclass, field
 
 from .mixins import Hashable
 from .abc import Messageable, GuildChannel, _purge_helper
 from .enums import ChannelType, try_enum
-from .errors import ClientException
+from .errors import ClientException, Forbidden, HTTPException, NotFound
 from .flags import ChannelFlags
 from .permissions import Permissions
 from .utils import MISSING, parse_time, _get_as_snowflake, _unique
@@ -39,6 +41,7 @@ from .utils import MISSING, parse_time, _get_as_snowflake, _unique
 __all__ = (
     'Thread',
     'ThreadMember',
+    'ThreadStats',
 )
 
 if TYPE_CHECKING:
@@ -60,6 +63,50 @@ if TYPE_CHECKING:
     from .state import ConnectionState
 
     ThreadChannelType = Literal[ChannelType.news_thread, ChannelType.public_thread, ChannelType.private_thread]
+
+
+@dataclass
+class ThreadStats:
+    """Statistics for a thread.
+    
+    Attributes
+    ----------
+    message_count: int
+        Number of messages in the thread.
+    member_count: int
+        Number of members in the thread.
+    last_activity: float
+        Timestamp of the last activity in the thread.
+    """
+    message_count: int = 0
+    member_count: int = 0
+    last_activity: float = field(default_factory=time.time)
+    
+    def update_activity(self) -> None:
+        """Updates the last activity timestamp."""
+        self.last_activity = time.time()
+    
+    def update_message_count(self, count: int) -> None:
+        """Updates the message count.
+        
+        Parameters
+        ----------
+        count: int
+            The new message count.
+        """
+        self.message_count = count
+        self.update_activity()
+    
+    def update_member_count(self, count: int) -> None:
+        """Updates the member count.
+        
+        Parameters
+        ----------
+        count: int
+            The new member count.
+        """
+        self.member_count = count
+        self.update_activity()
 
 
 class Thread(Messageable, Hashable):
@@ -121,15 +168,13 @@ class Thread(Messageable, Hashable):
         This is always ``True`` for public threads.
     archiver_id: Optional[:class:`int`]
         The user's ID that archived this thread.
-
-        .. note::
-            Due to an API change, the ``archiver_id`` will always be ``None`` and can only be obtained via the audit log.
-
     auto_archive_duration: :class:`int`
         The duration in minutes until the thread is automatically hidden from the channel list.
         Usually a value of 60, 1440, 4320 and 10080.
     archive_timestamp: :class:`datetime.datetime`
         An aware timestamp of when the thread's archived status was last updated in UTC.
+    stats: :class:`ThreadStats`
+        Statistics for this thread.
     """
 
     __slots__ = (
@@ -155,12 +200,20 @@ class Thread(Messageable, Hashable):
         '_created_at',
         '_flags',
         '_applied_tags',
+        'stats',
+        '_member_cache',
+        '_last_member_update',
+        '_member_update_interval',
     )
 
     def __init__(self, *, guild: Guild, state: ConnectionState, data: ThreadPayload) -> None:
         self._state: ConnectionState = state
         self.guild: Guild = guild
         self._members: Dict[int, ThreadMember] = {}
+        self._member_cache: Set[int] = set()
+        self._last_member_update: float = 0.0
+        self._member_update_interval: float = 300.0  # 5 minutes
+        self.stats: ThreadStats = ThreadStats()
         self._from_data(data)
 
     async def _get_channel(self) -> Self:
@@ -186,9 +239,12 @@ class Thread(Messageable, Hashable):
         self.message_count: int = data['message_count']
         self.member_count: int = data['member_count']
         self._flags: int = data.get('flags', 0)
-        # SnowflakeList is sorted, but this would not be proper for applied tags, where order actually matters.
         self._applied_tags: array.array[int] = array.array('Q', map(int, data.get('applied_tags', [])))
         self._unroll_metadata(data['thread_metadata'])
+
+        # Update stats
+        self.stats.update_message_count(self.message_count)
+        self.stats.update_member_count(self.member_count)
 
         self.me: Optional[ThreadMember]
         try:
@@ -197,6 +253,7 @@ class Thread(Messageable, Hashable):
             self.me = None
         else:
             self.me = ThreadMember(self, member)
+            self._add_member(self.me)
 
     def _unroll_metadata(self, data: ThreadMetadata):
         self.archived: bool = data['archived']
@@ -221,6 +278,15 @@ class Thread(Messageable, Hashable):
             self._unroll_metadata(data['thread_metadata'])
         except KeyError:
             pass
+
+        # Update stats if message or member count changed
+        if 'message_count' in data:
+            self.message_count = data['message_count']
+            self.stats.update_message_count(self.message_count)
+        
+        if 'member_count' in data:
+            self.member_count = data['member_count']
+            self.stats.update_member_count(self.member_count)
 
     @property
     def type(self) -> ThreadChannelType:
@@ -846,9 +912,24 @@ class Thread(Messageable, Hashable):
         List[:class:`ThreadMember`]
             All thread members in the thread.
         """
+        if not self._should_update_members():
+            return list(self._members.values())
 
-        members = await self._state.http.get_thread_members(self.id)
-        return [ThreadMember(parent=self, data=data) for data in members]
+        try:
+            members = await self._state.http.get_thread_members(self.id)
+            self._members.clear()
+            self._member_cache.clear()
+            
+            for member in members:
+                thread_member = ThreadMember(self, member)
+                self._add_member(thread_member)
+            
+            self._last_member_update = time.time()
+            return list(self._members.values())
+        except HTTPException as e:
+            if e.code == 50001:  # Missing Access
+                raise Forbidden("You do not have access to this thread.") from e
+            raise
 
     async def delete(self, *, reason: Optional[str] = None) -> None:
         """|coro|
@@ -897,11 +978,40 @@ class Thread(Messageable, Hashable):
 
         return PartialMessage(channel=self, id=message_id)
 
+    def _should_update_members(self) -> bool:
+        """Checks if the member cache should be updated."""
+        return time.time() - self._last_member_update > self._member_update_interval
+
     def _add_member(self, member: ThreadMember, /) -> None:
+        """Adds a member to the thread's member cache.
+        
+        Parameters
+        ----------
+        member: :class:`ThreadMember`
+            The member to add.
+        """
         self._members[member.id] = member
+        self._member_cache.add(member.id)
+        self.stats.update_activity()
 
     def _pop_member(self, member_id: int, /) -> Optional[ThreadMember]:
-        return self._members.pop(member_id, None)
+        """Removes a member from the thread's member cache.
+        
+        Parameters
+        ----------
+        member_id: :class:`int`
+            The ID of the member to remove.
+            
+        Returns
+        -------
+        Optional[:class:`ThreadMember`]
+            The removed member, if found.
+        """
+        member = self._members.pop(member_id, None)
+        if member is not None:
+            self._member_cache.discard(member_id)
+            self.stats.update_activity()
+        return member
 
 
 class ThreadMember(Hashable):
@@ -941,36 +1051,38 @@ class ThreadMember(Hashable):
         'id',
         'thread_id',
         'joined_at',
-        'flags',
+        '_flags',
         '_state',
-        'parent',
+        '_user',
+        '_member',
     )
 
     def __init__(self, parent: Thread, data: ThreadMemberPayload) -> None:
-        self.parent: Thread = parent
         self._state: ConnectionState = parent._state
+        self.thread_id: int = parent.id
         self._from_data(data)
 
-    def __repr__(self) -> str:
-        return f'<ThreadMember id={self.id} thread_id={self.thread_id} joined_at={self.joined_at!r}>'
-
     def _from_data(self, data: ThreadMemberPayload) -> None:
-        self.id: int
-        try:
-            self.id = int(data['user_id'])
-        except KeyError:
-            self.id = self._state.self_id  # type: ignore
-
-        self.thread_id: int
-        try:
-            self.thread_id = int(data['id'])
-        except KeyError:
-            self.thread_id = self.parent.id
-
+        self.id: int = int(data['user_id'])
         self.joined_at: datetime = parse_time(data['join_timestamp'])
-        self.flags: int = data['flags']
+        self._flags: int = data.get('flags', 0)
+        self._user = data.get('user')
+        self._member = data.get('member')
 
     @property
     def thread(self) -> Thread:
         """:class:`Thread`: The thread this member belongs to."""
-        return self.parent
+        return self._state._get_thread(self.thread_id)
+
+    @property
+    def member(self) -> Optional[Member]:
+        """Optional[:class:`Member`]: The member object for this thread member.
+        This is only available if the member is in the guild.
+        """
+        return self.thread.guild.get_member(self.id)
+
+    def __repr__(self) -> str:
+        return f'<ThreadMember id={self.id!r} thread_id={self.thread_id!r} joined_at={self.joined_at!r}>'
+
+    def __str__(self) -> str:
+        return str(self.member) if self.member else str(self.id)
