@@ -243,44 +243,7 @@ DWS = TypeVar('DWS', bound='DiscordWebSocket')
 
 
 class DiscordWebSocket:
-    """Implements a WebSocket for Discord's gateway v10.
-
-    Attributes
-    -----------
-    DISPATCH
-        Receive only. Denotes an event to be sent to Discord, such as READY.
-    HEARTBEAT
-        When received tells Discord to keep the connection alive.
-        When sent asks if your connection is currently alive.
-    IDENTIFY
-        Send only. Starts a new session.
-    PRESENCE
-        Send only. Updates your presence.
-    VOICE_STATE
-        Send only. Starts a new connection to a voice guild.
-    VOICE_PING
-        Send only. Checks ping time to a voice guild, do not use.
-    RESUME
-        Send only. Resumes an existing connection.
-    RECONNECT
-        Receive only. Tells the client to reconnect to a new gateway.
-    REQUEST_MEMBERS
-        Send only. Asks for the full member list of a guild.
-    INVALIDATE_SESSION
-        Receive only. Tells the client to optionally invalidate the session
-        and IDENTIFY again.
-    HELLO
-        Receive only. Tells the client the heartbeat interval.
-    HEARTBEAT_ACK
-        Receive only. Confirms receiving of a heartbeat. Not having it implies
-        a connection issue.
-    GUILD_SYNC
-        Send only. Requests a guild sync.
-    gateway
-        The gateway we are currently connected to.
-    token
-        The authentication token for discord.
-    """
+    """Implements a WebSocket for Discord's gateway v10 with enhanced reliability and monitoring."""
 
     if TYPE_CHECKING:
         token: Optional[str]
@@ -346,6 +309,10 @@ class DiscordWebSocket:
             'errors': 0,
             'latency': []
         }
+
+        # Message queue for rate limiting
+        self._message_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
+        self._message_processor: Optional[asyncio.Task] = None
 
     @property
     def open(self) -> bool:
@@ -627,13 +594,7 @@ class DiscordWebSocket:
         return code not in (1000, 4004, 4010, 4011, 4012, 4013, 4014)
 
     async def poll_event(self) -> None:
-        """Polls for a DISPATCH event and handles the general gateway loop.
-
-        Raises
-        ------
-        ConnectionClosed
-            The websocket connection was terminated for unhandled reasons.
-        """
+        """Polls for a DISPATCH event and handles the general gateway loop with enhanced error handling."""
         try:
             msg = await self.socket.receive(timeout=self._max_heartbeat_timeout)
             if msg.type is aiohttp.WSMsgType.TEXT:
@@ -685,12 +646,13 @@ class DiscordWebSocket:
         await self.socket.send_str(data)
 
     async def send_as_json(self, data: Any) -> None:
-        """Send data as JSON with enhanced error handling."""
+        """Send data as JSON with enhanced error handling and rate limiting."""
         try:
-            await self._rate_limiter.block()
-            await self.socket.send_str(utils._to_json(data))
+            await self._message_queue.put(data)
+            if self._message_processor is None or self._message_processor.done():
+                self._message_processor = self.loop.create_task(self._process_message_queue())
         except Exception as e:
-            _log.error('Error sending WebSocket message: %s', e)
+            _log.error('Error queueing WebSocket message: %s', e)
             await self._handle_connection_error(e)
             raise
 
@@ -789,6 +751,13 @@ class DiscordWebSocket:
             self._keep_alive.stop()
             self._keep_alive = None
 
+        if self._message_processor:
+            self._message_processor.cancel()
+            try:
+                await self._message_processor
+            except asyncio.CancelledError:
+                pass
+
         try:
             await self.socket.close(code=code, message=reason)
         except Exception as e:
@@ -846,6 +815,20 @@ class DiscordWebSocket:
         except Exception as e:
             _log.error('Reconnection attempt failed: %s', e)
             raise
+
+    async def _process_message_queue(self) -> None:
+        """Process messages from the queue with rate limiting."""
+        while True:
+            try:
+                message = await self._message_queue.get()
+                await self._rate_limiter.block()
+                await self.socket.send_str(utils._to_json(message))
+                self._message_queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                _log.error('Error processing message from queue: %s', e)
+                self._connection_stats['errors'] += 1
 
     def get_connection_stats(self) -> Dict[str, Any]:
         """Get detailed statistics about the WebSocket connection."""
