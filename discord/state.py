@@ -336,73 +336,73 @@ class ConnectionState(Generic[ClientT]):
             except Exception as e:
                 _log.error("Error updating state stats: %s", e)
 
-    def _track_event(self, event_name: str) -> None:
-        """Track event timing and counts."""
-        current_time = time.time()
-        if event_name not in self._event_times:
-            self._event_times[event_name] = []
-            self._event_counts[event_name] = 0
-            self._event_errors[event_name] = 0
-            
-        self._event_times[event_name].append(current_time)
-        self._event_counts[event_name] += 1
-        
-        # Keep only last 1000 events
-        if len(self._event_times[event_name]) > 1000:
-            self._event_times[event_name].pop(0)
-
     def _check_resource_limits(self) -> None:
-        """Check if we're approaching resource limits."""
-        guild_count = len(self._guilds)
-        channel_count = sum(len(g.channels) for g in self._guilds.values())
-        member_count = sum(len(g.members) for g in self._guilds.values())
-        
-        if guild_count > self._resource_limits['max_guilds'] * 0.9:
-            _log.warning("Approaching guild limit: %d/%d", guild_count, self._resource_limits['max_guilds'])
-        if channel_count > self._resource_limits['max_channels'] * 0.9:
-            _log.warning("Approaching channel limit: %d/%d", channel_count, self._resource_limits['max_channels'])
-        if member_count > self._resource_limits['max_members'] * 0.9:
-            _log.warning("Approaching member limit: %d/%d", member_count, self._resource_limits['max_members'])
+        """Check if any resource limits have been exceeded."""
+        if len(self._guilds) > self._resource_limits['max_guilds']:
+            _log.warning("Guild limit exceeded: %d/%d", len(self._guilds), self._resource_limits['max_guilds'])
+            
+        total_channels = sum(len(g.channels) for g in self._guilds.values())
+        if total_channels > self._resource_limits['max_channels']:
+            _log.warning("Channel limit exceeded: %d/%d", total_channels, self._resource_limits['max_channels'])
+            
+        total_members = sum(len(g.members) for g in self._guilds.values())
+        if total_members > self._resource_limits['max_members']:
+            _log.warning("Member limit exceeded: %d/%d", total_members, self._resource_limits['max_members'])
 
-    async def close(self) -> None:
-        """Clean up resources and close connections."""
-        # Cancel all cleanup tasks
-        for task in self._cleanup_tasks:
-            task.cancel()
-        self._cleanup_tasks.clear()
-        
-        # Close voice connections
-        for voice in self.voice_clients:
+    async def _cleanup_resources(self) -> None:
+        """Clean up unused resources periodically."""
+        while True:
             try:
-                await voice.disconnect(force=True)
-            except Exception:
-                pass
-
-        if self._translator:
-            await self._translator.unload()
+                # Clear old messages
+                if self._messages is not None:
+                    current_time = time.time()
+                    while self._messages and current_time - self._messages[0].created_at.timestamp() > 3600:
+                        self._messages.popleft()
+                
+                # Clear old event data
+                current_time = time.time()
+                for event in list(self._event_times.keys()):
+                    if current_time - self._event_times[event] > 3600:
+                        del self._event_times[event]
+                        del self._event_counts[event]
+                        if event in self._event_errors:
+                            del self._event_errors[event]
+                
+                await asyncio.sleep(300)  # Run every 5 minutes
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                _log.error("Error cleaning up resources: %s", e)
 
     def get_state_stats(self) -> Dict[str, Any]:
         """Get detailed statistics about the connection state."""
         stats = self._state_stats.copy()
         
         # Add event statistics
-        stats['events'] = {
-            name: {
-                'count': self._event_counts.get(name, 0),
-                'errors': self._event_errors.get(name, 0),
-                'avg_time': sum(times) / len(times) if times else 0
+        stats.update({
+            'event_counts': self._event_counts,
+            'event_errors': self._event_errors,
+            'resource_usage': {
+                'guilds': len(self._guilds),
+                'channels': sum(len(g.channels) for g in self._guilds.values()),
+                'members': sum(len(g.members) for g in self._guilds.values()),
+                'messages': len(self._messages) if self._messages else 0
             }
-            for name, times in self._event_times.items()
-        }
-        
-        # Add resource usage
-        stats['resources'] = {
-            'guilds': len(self._guilds),
-            'channels': sum(len(g.channels) for g in self._guilds.values()),
-            'members': sum(len(g.members) for g in self._guilds.values())
-        }
+        })
         
         return stats
+
+    async def close(self) -> None:
+        """Clean up resources and close the connection."""
+        # Cancel all cleanup tasks
+        for task in self._cleanup_tasks:
+            task.cancel()
+            
+        # Clear all caches
+        self.clear()
+        
+        # Close HTTP session
+        await self.http.close()
 
     # For some reason Discord still sends emoji/sticker data in payloads
     # This makes it hard to actually swap out the appropriate store methods
@@ -644,9 +644,102 @@ class ConnectionState(Generic[ClientT]):
         return utils.find(lambda m: m.id == msg_id, reversed(self._messages)) if self._messages else None
 
     def _add_guild_from_data(self, data: GuildPayload) -> Guild:
-        guild = Guild(data=data, state=self)
-        self._add_guild(guild)
-        return guild
+        """Add a guild from data with enhanced error handling and resource management."""
+        try:
+            guild_id = int(data['id'])
+            guild_obj = self._guilds.get(guild_id)
+            
+            if guild_obj is None:
+                guild_obj = Guild(data=data, state=self)
+                self._guilds[guild_id] = guild_obj
+                self._state_stats['state_changes'] += 1
+            else:
+                guild_obj._update(data=data)
+                
+            # Check resource limits
+            if len(self._guilds) > self._resource_limits['max_guilds']:
+                _log.warning(f"Guild limit exceeded: {len(self._guilds)}/{self._resource_limits['max_guilds']}")
+                
+            return guild_obj
+            
+        except Exception as e:
+            _log.error(f"Error adding guild from data: {e}")
+            raise
+
+    def _remove_guild(self, guild: Guild) -> None:
+        """Remove a guild with proper cleanup."""
+        try:
+            guild_id = guild.id
+            
+            # Remove guild from cache
+            self._guilds.pop(guild_id, None)
+            self._state_stats['state_changes'] += 1
+            
+            # Clean up guild resources
+            for channel in guild.channels:
+                self._remove_channel(channel)
+                
+            for member in guild.members:
+                self._remove_member(member)
+                
+            # Dispatch guild remove event
+            self.dispatch('guild_remove', guild)
+            
+        except Exception as e:
+            _log.error(f"Error removing guild: {e}")
+            raise
+
+    def _add_channel(self, channel: GuildChannel) -> None:
+        """Add a channel with resource management."""
+        try:
+            guild = channel.guild
+            if guild is not None:
+                guild._add_channel(channel)
+                
+                # Check channel limit
+                if len(guild.channels) > self._resource_limits['max_channels']:
+                    _log.warning(f"Channel limit exceeded for guild {guild.id}: {len(guild.channels)}/{self._resource_limits['max_channels']}")
+                    
+        except Exception as e:
+            _log.error(f"Error adding channel: {e}")
+            raise
+
+    def _remove_channel(self, channel: GuildChannel) -> None:
+        """Remove a channel with proper cleanup."""
+        try:
+            guild = channel.guild
+            if guild is not None:
+                guild._remove_channel(channel)
+                
+        except Exception as e:
+            _log.error(f"Error removing channel: {e}")
+            raise
+
+    def _add_member(self, member: Member) -> None:
+        """Add a member with resource management."""
+        try:
+            guild = member.guild
+            if guild is not None:
+                guild._add_member(member)
+                
+                # Check member limit
+                if len(guild.members) > self._resource_limits['max_members']:
+                    _log.warning(f"Member limit exceeded for guild {guild.id}: {len(guild.members)}/{self._resource_limits['max_members']}")
+                    
+        except Exception as e:
+            _log.error(f"Error adding member: {e}")
+            raise
+
+    def _remove_member(self, member: Member) -> None:
+        """Remove a member with proper cleanup."""
+        try:
+            guild = member.guild
+            if guild is not None:
+                guild._remove_member(member)
+                
+        except Exception as e:
+            _log.error(f"Error removing member: {e}")
+            raise
 
     def _guild_needs_chunking(self, guild: Guild) -> bool:
         # If presences are enabled then we get back the old guild.large behaviour
@@ -1924,6 +2017,126 @@ class ConnectionState(Generic[ClientT]):
             sound = guild._resolve_soundboard_sound(id)
             if sound is not None:
                 return sound
+
+    def _track_event(self, event_name: str) -> None:
+        """Track event timing and counts with enhanced monitoring."""
+        current_time = time.time()
+        
+        # Initialize event tracking if needed
+        if event_name not in self._event_times:
+            self._event_times[event_name] = []
+            self._event_counts[event_name] = 0
+            self._event_errors[event_name] = 0
+            
+        # Update event statistics
+        self._event_times[event_name].append(current_time)
+        self._event_counts[event_name] += 1
+        self._state_stats['total_events'] += 1
+        
+        # Keep only last 1000 events for memory efficiency
+        if len(self._event_times[event_name]) > 1000:
+            self._event_times[event_name].pop(0)
+            
+        # Check for event rate limiting
+        if len(self._event_times[event_name]) >= 100:
+            time_diff = current_time - self._event_times[event_name][0]
+            if time_diff < 1.0:  # More than 100 events per second
+                _log.warning(f"High event rate detected for {event_name}: {len(self._event_times[event_name])} events in {time_diff:.2f}s")
+
+    async def _handle_event(self, event_name: str, data: Any) -> None:
+        """Handle events with improved error handling and monitoring."""
+        try:
+            self._track_event(event_name)
+            
+            # Get the appropriate parser
+            parser = self.parsers.get(event_name)
+            if parser is None:
+                _log.debug('Unknown event %s.', event_name)
+                return
+                
+            # Parse the event data
+            try:
+                await parser(data)
+            except Exception as e:
+                self._event_errors[event_name] += 1
+                self._state_stats['failed_events'] += 1
+                _log.error('Error handling event %s: %s', event_name, e)
+                await self._handle_state_error(e)
+                
+        except Exception as e:
+            _log.error('Error in event handler for %s: %s', event_name, e)
+            await self._handle_state_error(e)
+
+    def _update_stats(self) -> None:
+        """Update connection statistics."""
+        current_time = time.time()
+        
+        # Calculate event rates
+        for event_name in self._event_times:
+            if len(self._event_times[event_name]) >= 2:
+                time_diff = current_time - self._event_times[event_name][0]
+                if time_diff > 0:
+                    rate = len(self._event_times[event_name]) / time_diff
+                    if rate > 100:  # More than 100 events per second
+                        _log.warning(f"High event rate for {event_name}: {rate:.2f} events/s")
+        
+        # Update latency statistics
+        if hasattr(self, 'latency'):
+            self._state_stats['latency'].append(self.latency)
+            if len(self._state_stats['latency']) > 100:
+                self._state_stats['latency'].pop(0)
+        
+        # Check resource usage
+        self._check_resource_limits()
+
+    async def parse_ready(self, data: gw.ReadyEvent) -> None:
+        """Parse the READY event with enhanced error handling."""
+        try:
+            self._ready.clear()
+            self.clear()
+            
+            # Update application info
+            self.application_id = utils._get_as_snowflake(data, 'application', 'id')
+            self.application_flags = ApplicationFlags._from_value(data['application']['flags'])
+            
+            # Update session info
+            self.session_id = data['session_id']
+            self._trace = data.get('_trace', [])
+            
+            # Update user info
+            self.user = ClientUser(state=self, data=data['user'])
+            
+            # Update guilds
+            for guild_data in data.get('guilds', []):
+                self._add_guild_from_data(guild_data)
+            
+            # Start monitoring tasks
+            self._cleanup_tasks.add(asyncio.create_task(self._update_state_stats()))
+            self._cleanup_tasks.add(asyncio.create_task(self._cleanup_resources()))
+            
+            # Set ready state
+            self._ready.set()
+            self._state_ready.set()
+            
+            # Dispatch ready event
+            self.dispatch('ready')
+            
+        except Exception as e:
+            _log.error('Error parsing READY event: %s', e)
+            await self._handle_state_error(e)
+            raise
+
+    async def parse_resumed(self, data: gw.ResumedEvent) -> None:
+        """Parse the RESUMED event with enhanced error handling."""
+        try:
+            self._ready.set()
+            self._state_ready.set()
+            self.dispatch('resumed')
+            
+        except Exception as e:
+            _log.error('Error parsing RESUMED event: %s', e)
+            await self._handle_state_error(e)
+            raise
 
 
 class AutoShardedConnectionState(ConnectionState[ClientT]):
