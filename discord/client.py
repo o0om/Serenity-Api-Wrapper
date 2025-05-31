@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
+import time
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -283,6 +284,23 @@ class Client:
         self._ready = asyncio.Event()
         self._connection = ConnectionState(dispatch=self.dispatch, handlers=self._handlers, hooks=self._hooks, http=self.http, **options)
         
+        # Enhanced error tracking and monitoring
+        self._error_count: int = 0
+        self._last_error_time: float = 0.0
+        self._max_errors: int = 5
+        self._start_time: float = 0.0
+        
+        # Performance monitoring
+        self._stats = {
+            'total_events': 0,
+            'failed_events': 0,
+            'reconnects': 0,
+            'errors': 0,
+            'latency': [],
+            'command_executions': 0,
+            'failed_commands': 0
+        }
+
     async def __aenter__(self) -> Self:
         await self._async_setup_hook()
         return self
@@ -766,16 +784,17 @@ class Client:
         self.http.clear()
 
     async def start(self, token: str, *, reconnect: bool = True) -> None:
+        """Enhanced start method with error handling."""
         try:
             await self._cache.start()
             await self._event_manager.start()
             await self.login(token)
             await self.connect(reconnect=reconnect)
         except Exception as e:
-            _log.error(f'Error starting client: {e}')
+            await self._handle_error(e, "client_start")
             await self.close()
             raise
-            
+
     def run(
         self,
         token: str,
@@ -2037,19 +2056,24 @@ class Client:
         return decorator
         
     async def on_message(self, message):
+        """Enhanced message handling with error tracking."""
         try:
+            self._stats['command_executions'] += 1
             await self._command_manager.process_message(message)
             await self._event_manager.dispatch('message', message)
         except Exception as e:
-            _log.error(f'Error processing message: {e}')
-            
+            self._stats['failed_commands'] += 1
+            await self._handle_error(e, "message_processing")
+
     async def on_ready(self):
+        """Enhanced ready event handling with error tracking."""
         try:
+            self._start_time = time.time()
             await self._event_manager.dispatch('ready')
             self._ready.set()
         except Exception as e:
-            _log.error(f'Error in ready event: {e}')
-            
+            await self._handle_error(e, "ready_event")
+
     def get_event_history(self, event_name: str, 
                          since: Optional[datetime] = None,
                          until: Optional[datetime] = None) -> List[Dict[str, Any]]:
@@ -3311,29 +3335,73 @@ class Client:
             return None
             
     async def _handle_socket_response(self, data):
+        """Handles socket responses with enhanced error handling."""
         try:
             await super()._handle_socket_response(data)
+            self._stats['total_events'] += 1
         except Exception as e:
-            if isinstance(e, ConnectionClosed):
-                await self._handle_connection_closed(e)
-            else:
-                _log.error(f'Error handling socket response: {e}')
-            raise e
-            
+            self._stats['failed_events'] += 1
+            await self._handle_error(e, "socket_response")
+            raise
+
     async def _handle_connection_closed(self, exc: ConnectionClosed):
+        """Handles connection closed events with enhanced recovery."""
         if exc.code == 1000:
             return
             
-        if self._reconnect_attempts < self._max_reconnect_attempts:
-            self._reconnect_attempts += 1
-            delay = self._reconnect_delay * (2 ** (self._reconnect_attempts - 1))
-            _log.info(f'Connection closed, attempting reconnect in {delay:.1f}s (attempt {self._reconnect_attempts}/{self._max_reconnect_attempts})')
+        await self._handle_error(exc, "connection_closed")
+        await self._attempt_reconnect()
+
+    async def _handle_error(self, error: Exception, context: str) -> None:
+        """Handles errors with tracking and recovery."""
+        current_time = time.time()
+        
+        # Reset error count if enough time has passed
+        if current_time - self._last_error_time > 60.0:  # Reset after 1 minute
+            self._error_count = 0
+            
+        self._error_count += 1
+        self._last_error_time = current_time
+        self._stats['errors'] += 1
+        
+        _log.error(f"Error in {context}: {error}")
+        
+        if self._error_count >= self._max_errors:
+            _log.error("Too many errors, attempting reconnection")
+            await self._attempt_reconnect()
+
+    async def _attempt_reconnect(self) -> None:
+        """Attempts to reconnect with exponential backoff."""
+        if self._reconnect_attempts >= self._max_reconnect_attempts:
+            _log.error("Max reconnect attempts reached")
+            await self.close()
+            return
+            
+        self._reconnect_attempts += 1
+        delay = self._reconnect_delay * (2 ** (self._reconnect_attempts - 1))
+        _log.info(f"Attempting reconnect in {delay:.1f}s (attempt {self._reconnect_attempts}/{self._max_reconnect_attempts})")
+        
+        try:
             await asyncio.sleep(delay)
-            try:
-                await self.connect()
-            except Exception as e:
-                _log.error(f'Reconnect attempt failed: {e}')
-                await self._handle_connection_closed(exc)
-        else:
-            _log.error(f'Max reconnect attempts reached ({self._max_reconnect_attempts})')
-            raise ConnectionClosed(exc.code, exc.reason)
+            await self.connect(reconnect=True)
+            self._reconnect_attempts = 0
+            self._stats['reconnects'] += 1
+        except Exception as e:
+            _log.error(f"Reconnect attempt failed: {e}")
+            await self._handle_error(e, "reconnect")
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get detailed statistics about the client."""
+        stats = self._stats.copy()
+        if stats['latency']:
+            stats['average_latency'] = sum(stats['latency']) / len(stats['latency'])
+            stats['min_latency'] = min(stats['latency'])
+            stats['max_latency'] = max(stats['latency'])
+        stats['uptime'] = time.time() - self._start_time
+        return stats
+
+    def update_latency(self, latency: float) -> None:
+        """Update latency statistics."""
+        self._stats['latency'].append(latency)
+        if len(self._stats['latency']) > 20:  # Keep last 20 measurements
+            self._stats['latency'].pop(0)
