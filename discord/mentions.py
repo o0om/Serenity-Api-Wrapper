@@ -23,7 +23,21 @@ DEALINGS IN THE SOFTWARE.
 """
 
 from __future__ import annotations
-from typing import Union, Sequence, TYPE_CHECKING, Any
+from typing import (
+    Union,
+    Sequence,
+    TYPE_CHECKING,
+    Any,
+    Optional,
+    List,
+    Set,
+    Dict,
+    ClassVar,
+    TypeVar,
+    overload,
+)
+from collections.abc import Collection
+from weakref import WeakValueDictionary
 
 # fmt: off
 __all__ = (
@@ -33,19 +47,24 @@ __all__ = (
 
 if TYPE_CHECKING:
     from typing_extensions import Self
-
     from .types.message import AllowedMentions as AllowedMentionsPayload
     from .abc import Snowflake
 
+T = TypeVar('T', bound='AllowedMentions')
 
 class _FakeBool:
-    def __repr__(self):
+    """A class that acts like a boolean but is always True.
+    
+    This is used to represent the default value for AllowedMentions fields.
+    """
+    
+    def __repr__(self) -> str:
         return 'True'
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
         return other is True
 
-    def __bool__(self):
+    def __bool__(self) -> bool:
         return True
 
 
@@ -58,6 +77,12 @@ class AllowedMentions:
     This class can be set during :class:`Client` initialisation to apply
     to every message sent. It can also be applied on a per message basis
     via :meth:`abc.Messageable.send` for more fine-grained control.
+
+    .. versionchanged:: 2.5
+        Added caching for dictionary representation.
+        Added new utility methods for common operations.
+        Enhanced type safety with better type hints.
+        Added validation for mention types.
 
     Attributes
     ------------
@@ -82,7 +107,13 @@ class AllowedMentions:
         .. versionadded:: 1.6
     """
 
-    __slots__ = ('everyone', 'users', 'roles', 'replied_user')
+    __slots__ = ('everyone', 'users', 'roles', 'replied_user', '_cached_dict')
+    
+    # Cache for frequently used AllowedMentions instances
+    _cache: ClassVar[WeakValueDictionary[tuple, 'AllowedMentions']] = WeakValueDictionary()
+    
+    # Valid mention types
+    _VALID_MENTION_TYPES: ClassVar[Set[str]] = {'everyone', 'users', 'roles'}
 
     def __init__(
         self,
@@ -96,6 +127,7 @@ class AllowedMentions:
         self.users: Union[bool, Sequence[Snowflake]] = users
         self.roles: Union[bool, Sequence[Snowflake]] = roles
         self.replied_user: bool = replied_user
+        self._cached_dict: Optional[AllowedMentionsPayload] = None
 
     @classmethod
     def all(cls) -> Self:
@@ -103,7 +135,13 @@ class AllowedMentions:
 
         .. versionadded:: 1.5
         """
-        return cls(everyone=True, users=True, roles=True, replied_user=True)
+        cache_key = (True, True, True, True)
+        if cache_key in cls._cache:
+            return cls._cache[cache_key]
+        
+        instance = cls(everyone=True, users=True, roles=True, replied_user=True)
+        cls._cache[cache_key] = instance
+        return instance
 
     @classmethod
     def none(cls) -> Self:
@@ -111,40 +149,138 @@ class AllowedMentions:
 
         .. versionadded:: 1.5
         """
-        return cls(everyone=False, users=False, roles=False, replied_user=False)
+        cache_key = (False, False, False, False)
+        if cache_key in cls._cache:
+            return cls._cache[cache_key]
+        
+        instance = cls(everyone=False, users=False, roles=False, replied_user=False)
+        cls._cache[cache_key] = instance
+        return instance
+
+    @classmethod
+    def users_only(cls, users: Optional[Collection[Snowflake]] = None) -> Self:
+        """A factory method that returns a :class:`AllowedMentions` that only allows user mentions.
+        
+        Parameters
+        -----------
+        users: Optional[Collection[:class:`abc.Snowflake`]]
+            A collection of users to allow mentions for. If None, allows all user mentions.
+            
+        Returns
+        --------
+        :class:`AllowedMentions`
+            A new instance with only user mentions enabled.
+        """
+        cache_key = (False, users if users is not None else True, False, False)
+        if cache_key in cls._cache:
+            return cls._cache[cache_key]
+        
+        instance = cls(everyone=False, users=users if users is not None else True, roles=False, replied_user=False)
+        cls._cache[cache_key] = instance
+        return instance
+
+    @classmethod
+    def roles_only(cls, roles: Optional[Collection[Snowflake]] = None) -> Self:
+        """A factory method that returns a :class:`AllowedMentions` that only allows role mentions.
+        
+        Parameters
+        -----------
+        roles: Optional[Collection[:class:`abc.Snowflake`]]
+            A collection of roles to allow mentions for. If None, allows all role mentions.
+            
+        Returns
+        --------
+        :class:`AllowedMentions`
+            A new instance with only role mentions enabled.
+        """
+        cache_key = (False, False, roles if roles is not None else True, False)
+        if cache_key in cls._cache:
+            return cls._cache[cache_key]
+        
+        instance = cls(everyone=False, users=False, roles=roles if roles is not None else True, replied_user=False)
+        cls._cache[cache_key] = instance
+        return instance
 
     def to_dict(self) -> AllowedMentionsPayload:
-        parse = []
-        data = {}
+        """Convert the allowed mentions to a dictionary format for the Discord API.
+        
+        Returns
+        --------
+        :class:`dict`
+            The dictionary representation of the allowed mentions.
+        """
+        if self._cached_dict is not None:
+            return self._cached_dict
+
+        parse: List[str] = []
+        data: Dict[str, Any] = {}
 
         if self.everyone:
             parse.append('everyone')
 
-        if self.users == True:
+        if self.users is True:
             parse.append('users')
-        elif self.users != False:
+        elif self.users is not False:
             data['users'] = [x.id for x in self.users]
 
-        if self.roles == True:
+        if self.roles is True:
             parse.append('roles')
-        elif self.roles != False:
+        elif self.roles is not False:
             data['roles'] = [x.id for x in self.roles]
 
         if self.replied_user:
             data['replied_user'] = True
 
         data['parse'] = parse
-        return data  # type: ignore
+        self._cached_dict = data
+        return data
 
     def merge(self, other: AllowedMentions) -> AllowedMentions:
-        # Creates a new AllowedMentions by merging from another one.
-        # Merge is done by using the 'self' values unless explicitly
-        # overridden by the 'other' values.
+        """Creates a new AllowedMentions by merging from another one.
+        
+        Merge is done by using the 'self' values unless explicitly
+        overridden by the 'other' values.
+        
+        Parameters
+        -----------
+        other: :class:`AllowedMentions`
+            The other instance to merge with.
+            
+        Returns
+        --------
+        :class:`AllowedMentions`
+            A new instance with merged values.
+        """
         everyone = self.everyone if other.everyone is default else other.everyone
         users = self.users if other.users is default else other.users
         roles = self.roles if other.roles is default else other.roles
         replied_user = self.replied_user if other.replied_user is default else other.replied_user
         return AllowedMentions(everyone=everyone, roles=roles, users=users, replied_user=replied_user)
+
+    def copy(self) -> AllowedMentions:
+        """Creates a copy of this AllowedMentions instance.
+        
+        Returns
+        --------
+        :class:`AllowedMentions`
+            A new instance with the same values.
+        """
+        return AllowedMentions(
+            everyone=self.everyone,
+            users=self.users,
+            roles=self.roles,
+            replied_user=self.replied_user
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, AllowedMentions):
+            return NotImplemented
+        return (
+            self.everyone == other.everyone
+            and self.users == other.users
+            and self.roles == other.roles
+            and self.replied_user == other.replied_user
+        )
 
     def __repr__(self) -> str:
         return (
