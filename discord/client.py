@@ -78,6 +78,9 @@ from .stage_instance import StageInstance
 from .threads import Thread
 from .sticker import GuildSticker, StandardSticker, StickerPack, _sticker_factory
 from .soundboard import SoundboardDefaultSound, SoundboardSound
+from .cache import CacheManager
+from .event_manager import EventManager, EventHandler
+from .command_manager import CommandManager, Command
 
 if TYPE_CHECKING:
     from types import TracebackType
@@ -264,50 +267,22 @@ class Client:
     """
 
     def __init__(self, *, intents: Intents, **options: Any) -> None:
-        self.loop: asyncio.AbstractEventLoop = _loop
-        # self.ws is set in the connect method
-        self.ws: DiscordWebSocket = None  # type: ignore
-        self._listeners: Dict[str, List[Tuple[asyncio.Future, Callable[..., bool]]]] = {}
-        self.shard_id: Optional[int] = options.get('shard_id')
-        self.shard_count: Optional[int] = options.get('shard_count')
-
-        connector: Optional[aiohttp.BaseConnector] = options.get('connector', None)
-        proxy: Optional[str] = options.pop('proxy', None)
-        proxy_auth: Optional[aiohttp.BasicAuth] = options.pop('proxy_auth', None)
-        unsync_clock: bool = options.pop('assume_unsync_clock', True)
-        http_trace: Optional[aiohttp.TraceConfig] = options.pop('http_trace', None)
-        max_ratelimit_timeout: Optional[float] = options.pop('max_ratelimit_timeout', None)
-        self.http: HTTPClient = HTTPClient(
-            self.loop,
-            connector,
-            proxy=proxy,
-            proxy_auth=proxy_auth,
-            unsync_clock=unsync_clock,
-            http_trace=http_trace,
-            max_ratelimit_timeout=max_ratelimit_timeout,
-        )
-
-        self._handlers: Dict[str, Callable[..., None]] = {
-            'ready': self._handle_ready,
-        }
-
-        self._hooks: Dict[str, Callable[..., Coroutine[Any, Any, Any]]] = {
-            'before_identify': self._call_before_identify_hook,
-        }
-
-        self._enable_debug_events: bool = options.pop('enable_debug_events', False)
-        self._connection: ConnectionState[Self] = self._get_state(intents=intents, **options)
-        self._connection.shard_count = self.shard_count
-        self._closing_task: Optional[asyncio.Task[None]] = None
-        self._ready: asyncio.Event = MISSING
-        self._application: Optional[AppInfo] = None
-        self._connection._get_websocket = self._get_websocket
-        self._connection._get_client = lambda: self
-
-        if VoiceClient.warn_nacl:
-            VoiceClient.warn_nacl = False
-            _log.warning("PyNaCl is not installed, voice will NOT be supported")
-
+        self._cache = CacheManager()
+        self._event_manager = EventManager()
+        self._command_manager = CommandManager(options.get('command_prefix', '!'))
+        self._voice_clients = {}
+        self._connection_timeout = options.get('connection_timeout', 30)
+        self._max_reconnect_attempts = options.get('max_reconnect_attempts', 5)
+        self._reconnect_delay = options.get('reconnect_delay', 1.0)
+        self._shard_count = None
+        self._shard_ids = None
+        self._shard_ready = asyncio.Event()
+        self._shards = {}
+        self._reconnect_attempts = 0
+        self._closing_task = None
+        self._ready = asyncio.Event()
+        self._connection = ConnectionState(dispatch=self.dispatch, handlers=self._handlers, hooks=self._hooks, http=self.http, **options)
+        
     async def __aenter__(self) -> Self:
         await self._async_setup_hook()
         return self
@@ -791,29 +766,16 @@ class Client:
         self.http.clear()
 
     async def start(self, token: str, *, reconnect: bool = True) -> None:
-        """|coro|
-
-        A shorthand coroutine for :meth:`login` + :meth:`connect`.
-
-        Parameters
-        -----------
-        token: :class:`str`
-            The authentication token. Do not prefix this token with
-            anything as the library will do it for you.
-        reconnect: :class:`bool`
-            If we should attempt reconnecting, either due to internet
-            failure or a specific failure on Discord's part. Certain
-            disconnects that lead to bad state will not be handled (such as
-            invalid sharding payloads or bad tokens).
-
-        Raises
-        -------
-        TypeError
-            An unexpected keyword argument was received.
-        """
-        await self.login(token)
-        await self.connect(reconnect=reconnect)
-
+        try:
+            await self._cache.start()
+            await self._event_manager.start()
+            await self.login(token)
+            await self.connect(reconnect=reconnect)
+        except Exception as e:
+            _log.error(f'Error starting client: {e}')
+            await self.close()
+            raise
+            
     def run(
         self,
         token: str,
@@ -2058,38 +2020,100 @@ class Client:
 
     # event registration
 
-    def event(self, coro: CoroT, /) -> CoroT:
-        """A decorator that registers an event to listen to.
-
-        You can find more info about the events on the :ref:`documentation below <discord-api-events>`.
-
-        The events must be a :ref:`coroutine <coroutine>`, if not, :exc:`TypeError` is raised.
-
-        Example
-        ---------
-
-        .. code-block:: python3
-
-            @client.event
-            async def on_ready():
-                print('Ready!')
-
-        .. versionchanged:: 2.0
-
-            ``coro`` parameter is now positional-only.
-
-        Raises
-        --------
-        TypeError
-            The coroutine passed is not actually a coroutine.
-        """
-
-        if not asyncio.iscoroutinefunction(coro):
-            raise TypeError('event registered must be a coroutine function')
-
-        setattr(self, coro.__name__, coro)
-        _log.debug('%s has successfully been registered as an event', coro.__name__)
-        return coro
+    def event(self, name: Optional[str] = None):
+        def decorator(func):
+            event_name = name or func.__name__
+            handler = EventHandler(func)
+            self._event_manager.add_handler(event_name, handler)
+            return func
+        return decorator
+        
+    def command(self, name: Optional[str] = None, **options):
+        def decorator(func):
+            command_name = name or func.__name__
+            command = Command(command_name, func, **options)
+            self._command_manager.add_command(command)
+            return func
+        return decorator
+        
+    async def on_message(self, message):
+        try:
+            await self._command_manager.process_message(message)
+            await self._event_manager.dispatch('message', message)
+        except Exception as e:
+            _log.error(f'Error processing message: {e}')
+            
+    async def on_ready(self):
+        try:
+            await self._event_manager.dispatch('ready')
+            self._ready.set()
+        except Exception as e:
+            _log.error(f'Error in ready event: {e}')
+            
+    def get_event_history(self, event_name: str, 
+                         since: Optional[datetime] = None,
+                         until: Optional[datetime] = None) -> List[Dict[str, Any]]:
+        return self._event_manager.get_event_history(event_name, since, until)
+        
+    def clear_event_history(self, event_name: Optional[str] = None) -> None:
+        self._event_manager.clear_history(event_name)
+        
+    def get_command(self, name: str) -> Optional[Command]:
+        return self._command_manager.get_command(name)
+        
+    def remove_command(self, name: str) -> None:
+        self._command_manager.remove_command(name)
+        
+    async def get_or_fetch_guild(self, guild_id: int) -> Optional[Guild]:
+        try:
+            cached = await self._cache.get(f'guild:{guild_id}')
+            if cached is not None:
+                return cached
+                
+            guild = await self.fetch_guild(guild_id)
+            await self._cache.set(f'guild:{guild_id}', guild)
+            return guild
+        except HTTPException as e:
+            _log.error(f'Error fetching guild {guild_id}: {e}')
+            return None
+            
+    async def get_or_fetch_channel(self, channel_id: int) -> Optional[Union[TextChannel, VoiceChannel, CategoryChannel]]:
+        try:
+            cached = await self._cache.get(f'channel:{channel_id}')
+            if cached is not None:
+                return cached
+                
+            channel = await self.fetch_channel(channel_id)
+            await self._cache.set(f'channel:{channel_id}', channel)
+            return channel
+        except HTTPException as e:
+            _log.error(f'Error fetching channel {channel_id}: {e}')
+            return None
+            
+    def get_voice_client(self, guild_id: int) -> Optional[VoiceClient]:
+        return self._voice_clients.get(guild_id)
+        
+    async def connect_to_voice(self, channel: VoiceChannel, *, timeout: float = 60.0) -> VoiceClient:
+        if channel.guild.id in self._voice_clients:
+            return self._voice_clients[channel.guild.id]
+            
+        try:
+            voice_client = VoiceClient(self, channel)
+            await voice_client.connect(timeout=timeout, reconnect=True)
+            self._voice_clients[channel.guild.id] = voice_client
+            return voice_client
+        except Exception as e:
+            _log.error(f'Error connecting to voice channel: {e}')
+            raise
+            
+    async def disconnect_from_voice(self, guild_id: int) -> None:
+        if guild_id in self._voice_clients:
+            try:
+                await self._voice_clients[guild_id].disconnect()
+                del self._voice_clients[guild_id]
+            except Exception as e:
+                _log.error(f'Error disconnecting from voice: {e}')
+                raise
 
     async def change_presence(
         self,
@@ -3249,3 +3273,67 @@ class Client:
 
         data = await self.http.get_application_emojis(self.application_id)
         return [Emoji(guild=Object(0), state=self._connection, data=emoji) for emoji in data['items']]
+
+    async def get_or_fetch_user(self, user_id: int) -> Optional[User]:
+        cached = await self._cache.get(f'user:{user_id}')
+        if cached is not None:
+            return cached
+            
+        try:
+            user = await self.fetch_user(user_id)
+            await self._cache.set(f'user:{user_id}', user)
+            return user
+        except HTTPException:
+            return None
+            
+    async def get_or_fetch_guild(self, guild_id: int) -> Optional[Guild]:
+        cached = await self._cache.get(f'guild:{guild_id}')
+        if cached is not None:
+            return cached
+            
+        try:
+            guild = await self.fetch_guild(guild_id)
+            await self._cache.set(f'guild:{guild_id}', guild)
+            return guild
+        except HTTPException:
+            return None
+            
+    async def get_or_fetch_channel(self, channel_id: int) -> Optional[Union[TextChannel, VoiceChannel, CategoryChannel]]:
+        cached = await self._cache.get(f'channel:{channel_id}')
+        if cached is not None:
+            return cached
+            
+        try:
+            channel = await self.fetch_channel(channel_id)
+            await self._cache.set(f'channel:{channel_id}', channel)
+            return channel
+        except HTTPException:
+            return None
+            
+    async def _handle_socket_response(self, data):
+        try:
+            await super()._handle_socket_response(data)
+        except Exception as e:
+            if isinstance(e, ConnectionClosed):
+                await self._handle_connection_closed(e)
+            else:
+                _log.error(f'Error handling socket response: {e}')
+            raise e
+            
+    async def _handle_connection_closed(self, exc: ConnectionClosed):
+        if exc.code == 1000:
+            return
+            
+        if self._reconnect_attempts < self._max_reconnect_attempts:
+            self._reconnect_attempts += 1
+            delay = self._reconnect_delay * (2 ** (self._reconnect_attempts - 1))
+            _log.info(f'Connection closed, attempting reconnect in {delay:.1f}s (attempt {self._reconnect_attempts}/{self._max_reconnect_attempts})')
+            await asyncio.sleep(delay)
+            try:
+                await self.connect()
+            except Exception as e:
+                _log.error(f'Reconnect attempt failed: {e}')
+                await self._handle_connection_closed(exc)
+        else:
+            _log.error(f'Max reconnect attempts reached ({self._max_reconnect_attempts})')
+            raise ConnectionClosed(exc.code, exc.reason)
