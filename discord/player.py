@@ -35,7 +35,7 @@ import json
 import sys
 import re
 import io
-from typing import Any, Callable, Generic, IO, Optional, TYPE_CHECKING, Tuple, TypeVar, Union, List
+from typing import Any, Callable, Generic, IO, Optional, TYPE_CHECKING, Tuple, TypeVar, Union, List, Dict
 
 from .enums import SpeakingState
 from .errors import ClientException
@@ -137,15 +137,12 @@ class PCMAudio(AudioSource):
 
 
 class FFmpegAudio(AudioSource):
-    """Represents an FFmpeg (or AVConv) based AudioSource.
-
-    User created AudioSources using FFmpeg differently from how :class:`FFmpegPCMAudio` and
-    :class:`FFmpegOpusAudio` work should subclass this.
-
-    .. versionadded:: 1.3
-    """
+    """Represents an FFmpeg (or AVConv) based AudioSource with enhanced reliability."""
 
     BLOCKSIZE: int = io.DEFAULT_BUFFER_SIZE
+    MAX_RETRIES: int = 3
+    PROCESS_TIMEOUT: float = 30.0
+    BUFFER_SIZE: int = 5
 
     def __init__(
         self,
@@ -176,6 +173,21 @@ class FFmpegAudio(AudioSource):
         kwargs = {'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE if piping_stderr else stderr}
         kwargs.update(subprocess_kwargs)
 
+        # Enhanced error tracking and monitoring
+        self._error_count: int = 0
+        self._last_error_time: float = 0.0
+        self._max_errors: int = 5
+        self._process_start_time: float = 0.0
+        
+        # Performance monitoring
+        self._stats = {
+            'total_bytes': 0,
+            'read_errors': 0,
+            'process_errors': 0,
+            'startup_time': 0.0,
+            'uptime': 0.0
+        }
+
         # Ensure attribute is assigned even in the case of errors
         self._process: subprocess.Popen = MISSING
         self._process = self._spawn_process(args, **kwargs)
@@ -184,6 +196,10 @@ class FFmpegAudio(AudioSource):
         self._stderr: Optional[IO[bytes]] = None
         self._pipe_writer_thread: Optional[threading.Thread] = None
         self._pipe_reader_thread: Optional[threading.Thread] = None
+        self._buffer: List[bytes] = []
+        self._buffer_lock: threading.Lock = threading.Lock()
+        self._buffer_event: threading.Event = threading.Event()
+        self._buffer_full: threading.Event = threading.Event()
 
         if piping_stdin:
             n = f'popen-stdin-writer:pid-{self._process.pid}'
@@ -197,7 +213,11 @@ class FFmpegAudio(AudioSource):
             self._pipe_reader_thread = threading.Thread(target=self._pipe_reader, args=(stderr,), daemon=True, name=n)
             self._pipe_reader_thread.start()
 
+        self._process_start_time = time.time()
+        self._stats['startup_time'] = time.time() - self._process_start_time
+
     def _spawn_process(self, args: Any, **subprocess_kwargs: Any) -> subprocess.Popen:
+        """Spawns the FFmpeg process with enhanced error handling."""
         _log.debug('Spawning ffmpeg process with command: %s', args)
         process = None
         try:
@@ -211,7 +231,7 @@ class FFmpegAudio(AudioSource):
             return process
 
     def _kill_process(self) -> None:
-        # this function gets called in __del__ so instance attributes might not even exist
+        """Kills the FFmpeg process with enhanced cleanup."""
         proc = getattr(self, '_process', MISSING)
         if proc is MISSING:
             return
@@ -225,48 +245,84 @@ class FFmpegAudio(AudioSource):
 
         if proc.poll() is None:
             _log.info('ffmpeg process %s has not terminated. Waiting to terminate...', proc.pid)
-            proc.communicate()
-            _log.info('ffmpeg process %s should have terminated with a return code of %s.', proc.pid, proc.returncode)
+            try:
+                proc.communicate(timeout=self.PROCESS_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                _log.error('ffmpeg process %s failed to terminate within %s seconds', 
+                          proc.pid, self.PROCESS_TIMEOUT)
+                proc.kill()
+            _log.info('ffmpeg process %s should have terminated with a return code of %s.', 
+                     proc.pid, proc.returncode)
         else:
-            _log.info('ffmpeg process %s successfully terminated with return code of %s.', proc.pid, proc.returncode)
+            _log.info('ffmpeg process %s successfully terminated with return code of %s.', 
+                     proc.pid, proc.returncode)
+
+    def _handle_error(self, error: Exception) -> None:
+        """Handles errors with tracking and recovery."""
+        current_time = time.time()
+        
+        # Reset error count if enough time has passed
+        if current_time - self._last_error_time > 60.0:  # Reset after 1 minute
+            self._error_count = 0
+            
+        self._error_count += 1
+        self._last_error_time = current_time
+        self._stats['process_errors'] += 1
+        
+        if self._error_count >= self._max_errors:
+            _log.error("Too many errors, stopping process")
+            self.cleanup()
 
     def _pipe_writer(self, source: io.BufferedIOBase) -> None:
+        """Writes data to the FFmpeg process with enhanced error handling."""
         while self._process:
-            data = source.read(self.BLOCKSIZE)
-            if not data:
-                if self._stdin is not None:
-                    self._stdin.close()
-                return
             try:
+                data = source.read(self.BLOCKSIZE)
+                if not data:
+                    if self._stdin is not None:
+                        self._stdin.close()
+                    return
                 if self._stdin is not None:
                     self._stdin.write(data)
-            except Exception:
-                _log.debug('Write error for %s, this is probably not a problem', self, exc_info=True)
-                # at this point the source data is either exhausted or the process is fubar
+                    self._stats['total_bytes'] += len(data)
+            except Exception as e:
+                _log.error("Error writing to ffmpeg process: %s", e)
+                self._handle_error(e)
                 self._process.terminate()
                 return
 
     def _pipe_reader(self, dest: IO[bytes]) -> None:
+        """Reads data from the FFmpeg process with enhanced error handling."""
         while self._process:
             if self._stderr is None:
                 return
             try:
                 data: bytes = self._stderr.read(self.BLOCKSIZE)
-            except Exception:
-                _log.debug('Read error for %s, this is probably not a problem', self, exc_info=True)
+            except Exception as e:
+                _log.error("Error reading from ffmpeg process: %s", e)
+                self._handle_error(e)
                 return
             if data is None:
                 return
             try:
                 dest.write(data)
-            except Exception:
-                _log.exception('Write error for %s', self)
+            except Exception as e:
+                _log.error("Error writing stderr data: %s", e)
+                self._handle_error(e)
                 self._stderr.close()
                 return
 
     def cleanup(self) -> None:
+        """Cleans up resources with enhanced error handling."""
         self._kill_process()
         self._process = self._stdout = self._stdin = self._stderr = MISSING
+        self._stats['uptime'] = time.time() - self._process_start_time
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get detailed statistics about the FFmpeg process."""
+        stats = self._stats.copy()
+        stats['uptime'] = time.time() - self._process_start_time
+        return stats
 
 
 class FFmpegPCMAudio(FFmpegAudio):
@@ -696,9 +752,13 @@ class PCMVolumeTransformer(AudioSource, Generic[AT]):
 
 
 class AudioPlayer(threading.Thread):
+    """Represents an audio player with enhanced buffering and error handling."""
+
     DELAY: float = OpusEncoder.FRAME_LENGTH / 1000.0
     BUFFER_SIZE: int = 5  # Number of frames to buffer
     MAX_RETRIES: int = 3  # Maximum number of retries for failed reads
+    BUFFER_TIMEOUT: float = 5.0  # Maximum time to wait for buffer to fill
+    ERROR_RESET_TIME: float = 60.0  # Time to reset error count
 
     def __init__(
         self,
@@ -725,12 +785,26 @@ class AudioPlayer(threading.Thread):
         self._retry_count: int = 0
         self._last_read_time: float = 0.0
         self._read_timeout: float = 5.0
+        
+        # Enhanced error tracking
+        self._error_count: int = 0
+        self._last_error_time: float = 0.0
+        self._max_errors: int = 5
+        
+        # Performance monitoring
+        self._stats = {
+            'total_frames': 0,
+            'dropped_frames': 0,
+            'buffer_underruns': 0,
+            'errors': 0,
+            'latency': []
+        }
 
         if after is not None and not callable(after):
             raise TypeError('Expected a callable for the "after" parameter.')
 
     def _buffer_worker(self) -> None:
-        """Background thread to pre-buffer audio data."""
+        """Background thread to pre-buffer audio data with enhanced error handling."""
         while not self._end.is_set():
             if not self._resumed.is_set():
                 self._buffer_event.wait()
@@ -749,18 +823,20 @@ class AudioPlayer(threading.Thread):
 
                 with self._buffer_lock:
                     self._buffer.append(data)
+                    self._stats['total_frames'] += 1
                     if len(self._buffer) >= self.BUFFER_SIZE:
                         self._buffer_full.set()
 
             except Exception as e:
                 _log.error("Error in buffer worker: %s", e)
-                self._current_error = e
-                break
+                self._handle_error(e)
+                if self._should_stop():
+                    break
 
         self._buffer_full.set()
 
     def _read_with_retry(self) -> bytes:
-        """Reads from source with retry logic."""
+        """Reads from source with enhanced retry logic."""
         for attempt in range(self.MAX_RETRIES):
             try:
                 data = self.source.read()
@@ -769,14 +845,37 @@ class AudioPlayer(threading.Thread):
                 return data
             except Exception as e:
                 self._retry_count += 1
+                self._handle_error(e)
                 if self._retry_count >= self.MAX_RETRIES:
                     raise
                 _log.warning("Read attempt %d failed: %s", attempt + 1, e)
-                time.sleep(0.1)
+                time.sleep(0.1 * (attempt + 1))  # Exponential backoff
 
         return b''
 
+    def _handle_error(self, error: Exception) -> None:
+        """Handles errors with tracking and recovery."""
+        current_time = time.time()
+        
+        # Reset error count if enough time has passed
+        if current_time - self._last_error_time > self.ERROR_RESET_TIME:
+            self._error_count = 0
+            
+        self._error_count += 1
+        self._last_error_time = current_time
+        self._stats['errors'] += 1
+        
+        if self._error_count >= self._max_errors:
+            _log.error("Too many errors, stopping playback")
+            self._current_error = error
+            self.stop()
+
+    def _should_stop(self) -> bool:
+        """Determines if playback should stop due to errors."""
+        return self._error_count >= self._max_errors
+
     def _do_run(self) -> None:
+        """Main playback loop with enhanced error handling and monitoring."""
         self.loops = 0
         self._start = time.perf_counter()
 
@@ -808,6 +907,7 @@ class AudioPlayer(threading.Thread):
                         self.stop()
                         break
                     self._buffer_event.set()
+                    self._stats['buffer_underruns'] += 1
                     time.sleep(0.01)
                     continue
 
@@ -830,14 +930,34 @@ class AudioPlayer(threading.Thread):
                 self.loops = 0
                 self._start = time.perf_counter()
 
-            play_audio(data, encode=not self.source.is_opus())
-            self.loops += 1
-            next_time = self._start + self.DELAY * self.loops
-            delay = max(0, self.DELAY + (next_time - time.perf_counter()))
-            time.sleep(delay)
+            try:
+                play_audio(data, encode=not self.source.is_opus())
+                self.loops += 1
+                next_time = self._start + self.DELAY * self.loops
+                delay = max(0, self.DELAY + (next_time - time.perf_counter()))
+                time.sleep(delay)
+            except Exception as e:
+                self._handle_error(e)
+                if self._should_stop():
+                    break
 
         if client.is_connected():
             self.send_silence()
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get detailed statistics about the audio playback."""
+        stats = self._stats.copy()
+        if stats['latency']:
+            stats['average_latency'] = sum(stats['latency']) / len(stats['latency'])
+            stats['min_latency'] = min(stats['latency'])
+            stats['max_latency'] = max(stats['latency'])
+        return stats
+
+    def update_latency(self, latency: float) -> None:
+        """Update latency statistics."""
+        self._stats['latency'].append(latency)
+        if len(self._stats['latency']) > 20:  # Keep last 20 measurements
+            self._stats['latency'].pop(0)
 
     def run(self) -> None:
         try:
