@@ -24,8 +24,10 @@ DEALINGS IN THE SOFTWARE.
 
 from __future__ import annotations
 
-from typing import Callable, Any, ClassVar, Dict, Iterator, Set, TYPE_CHECKING, Tuple, Optional
+from typing import Callable, Any, ClassVar, Dict, Iterator, Set, TYPE_CHECKING, Tuple, Optional, List, Union
 from .flags import BaseFlags, flag_value, fill_with_flags, alias_flag_value
+import functools
+from weakref import WeakValueDictionary
 
 __all__ = (
     'Permissions',
@@ -34,6 +36,9 @@ __all__ = (
 
 if TYPE_CHECKING:
     from typing_extensions import Self
+
+# Cache for frequently used permission combinations
+_PERMISSION_CACHE: WeakValueDictionary[int, 'Permissions'] = WeakValueDictionary()
 
 # A permission alias works like a regular flag but is marked
 # So the PermissionOverwrite knows to work with it
@@ -61,6 +66,11 @@ class Permissions(BaseFlags):
     .. versionchanged:: 1.3
         You can now use keyword arguments to initialize :class:`Permissions`
         similar to :meth:`update`.
+
+    .. versionchanged:: 2.5
+        Added caching for frequently used permission combinations.
+        Added new utility methods for common permission operations.
+        Enhanced type safety with better type hints.
 
     .. container:: operations
 
@@ -133,7 +143,7 @@ class Permissions(BaseFlags):
         permissions via the properties rather than using this raw value.
     """
 
-    __slots__ = ()
+    __slots__ = ('value',)
 
     def __init__(self, permissions: int = 0, **kwargs: bool):
         if not isinstance(permissions, int):
@@ -148,25 +158,133 @@ class Permissions(BaseFlags):
             else:
                 self._set_flag(flag, value)
 
-    def is_subset(self, other: Permissions) -> bool:
+    def __new__(cls, permissions: int = 0, **kwargs: bool) -> 'Permissions':
+        # Check cache for frequently used permission combinations
+        if not kwargs and permissions in _PERMISSION_CACHE:
+            return _PERMISSION_CACHE[permissions]
+        
+        instance = super().__new__(cls)
+        instance.value = permissions
+        for key, value in kwargs.items():
+            try:
+                flag = cls.VALID_FLAGS[key]
+            except KeyError:
+                raise TypeError(f'{key!r} is not a valid permission name.') from None
+            else:
+                instance._set_flag(flag, value)
+        
+        # Cache the instance if it's a simple permission value
+        if not kwargs:
+            _PERMISSION_CACHE[permissions] = instance
+        
+        return instance
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, bool]) -> 'Permissions':
+        """Creates a :class:`Permissions` instance from a dictionary of permission names to boolean values.
+
+        Parameters
+        -----------
+        data: Dict[:class:`str`, :class:`bool`]
+            A dictionary mapping permission names to their boolean values.
+
+        Returns
+        --------
+        :class:`Permissions`
+            The created permissions instance.
+
+        Raises
+        -------
+        TypeError
+            If any of the permission names are invalid.
+        """
+        return cls(**data)
+
+    def to_dict(self) -> Dict[str, bool]:
+        """Converts the permissions to a dictionary mapping permission names to boolean values.
+
+        Returns
+        --------
+        Dict[:class:`str`, :class:`bool`]
+            A dictionary of permission names to their boolean values.
+        """
+        return {name: bool(getattr(self, name)) for name in self.VALID_FLAGS}
+
+    def get_missing_permissions(self, required: 'Permissions') -> List[str]:
+        """Returns a list of permission names that are missing from the current permissions
+        compared to the required permissions.
+
+        Parameters
+        -----------
+        required: :class:`Permissions`
+            The permissions to check against.
+
+        Returns
+        --------
+        List[:class:`str`]
+            A list of permission names that are missing.
+        """
+        return [name for name, value in required if value and not getattr(self, name)]
+
+    def has_any(self, *permissions: str) -> bool:
+        """Checks if the user has any of the given permissions.
+
+        Parameters
+        -----------
+        *permissions: :class:`str`
+            The permission names to check.
+
+        Returns
+        --------
+        :class:`bool`
+            Whether the user has any of the given permissions.
+
+        Raises
+        -------
+        TypeError
+            If any of the permission names are invalid.
+        """
+        return any(getattr(self, perm) for perm in permissions)
+
+    def has_all(self, *permissions: str) -> bool:
+        """Checks if the user has all of the given permissions.
+
+        Parameters
+        -----------
+        *permissions: :class:`str`
+            The permission names to check.
+
+        Returns
+        --------
+        :class:`bool`
+            Whether the user has all of the given permissions.
+
+        Raises
+        -------
+        TypeError
+            If any of the permission names are invalid.
+        """
+        return all(getattr(self, perm) for perm in permissions)
+
+    def is_subset(self, other: 'Permissions') -> bool:
         """Returns ``True`` if self has the same or fewer permissions as other."""
         if isinstance(other, Permissions):
             return (self.value & other.value) == self.value
         else:
             raise TypeError(f"cannot compare {self.__class__.__name__} with {other.__class__.__name__}")
 
-    def is_superset(self, other: Permissions) -> bool:
+    def is_superset(self, other: 'Permissions') -> bool:
         """Returns ``True`` if self has the same or more permissions as other."""
         if isinstance(other, Permissions):
             return (self.value | other.value) == self.value
         else:
             raise TypeError(f"cannot compare {self.__class__.__name__} with {other.__class__.__name__}")
 
-    def is_strict_subset(self, other: Permissions) -> bool:
+    def is_strict_subset(self, other: 'Permissions') -> bool:
         """Returns ``True`` if the permissions on other are a strict subset of those on self."""
         return self.is_subset(other) and self != other
 
-    def is_strict_superset(self, other: Permissions) -> bool:
+    def is_strict_superset(self, other: 'Permissions') -> bool:
         """Returns ``True`` if the permissions on other are a strict superset of those on self."""
         return self.is_superset(other) and self != other
 
@@ -176,13 +294,13 @@ class Permissions(BaseFlags):
     __gt__ = is_strict_superset
 
     @classmethod
-    def none(cls) -> Self:
+    def none(cls) -> 'Permissions':
         """A factory method that creates a :class:`Permissions` with all
         permissions set to ``False``."""
         return cls(0)
 
     @classmethod
-    def all(cls) -> Self:
+    def all(cls) -> 'Permissions':
         """A factory method that creates a :class:`Permissions` with all
         permissions set to ``True``.
         """
@@ -197,7 +315,7 @@ class Permissions(BaseFlags):
         return ~p.value
 
     @classmethod
-    def _dm_permissions(cls) -> Self:
+    def _dm_permissions(cls) -> 'Permissions':
         base = cls.text()
         base.read_messages = True
         base.send_tts_messages = False
@@ -209,7 +327,7 @@ class Permissions(BaseFlags):
         return base
 
     @classmethod
-    def _user_installed_permissions(cls, *, in_guild: bool) -> Self:
+    def _user_installed_permissions(cls, *, in_guild: bool) -> 'Permissions':
         base = cls.none()
         base.send_messages = True
         base.attach_files = True
@@ -225,7 +343,7 @@ class Permissions(BaseFlags):
         return base
 
     @classmethod
-    def all_channel(cls) -> Self:
+    def all_channel(cls) -> 'Permissions':
         """A :class:`Permissions` with all channel-specific permissions set to
         ``True`` and the guild-specific ones set to ``False``. The guild-specific
         permissions are currently:
@@ -263,7 +381,7 @@ class Permissions(BaseFlags):
         return cls(0b0000_0000_0000_0110_0110_0100_1111_1101_1011_0011_1111_0111_1111_1111_0101_0001)
 
     @classmethod
-    def general(cls) -> Self:
+    def general(cls) -> 'Permissions':
         """A factory method that creates a :class:`Permissions` with all
         "General" permissions from the official Discord UI set to ``True``.
 
@@ -282,7 +400,7 @@ class Permissions(BaseFlags):
         return cls(0b0000_0000_0000_0000_0000_1010_0000_0000_0111_0000_0000_1000_0000_0100_1011_0000)
 
     @classmethod
-    def membership(cls) -> Self:
+    def membership(cls) -> 'Permissions':
         """A factory method that creates a :class:`Permissions` with all
         "Membership" permissions from the official Discord UI set to ``True``.
 
@@ -291,7 +409,7 @@ class Permissions(BaseFlags):
         return cls(0b0000_0000_0000_0000_0000_0001_0000_0000_0000_1100_0000_0000_0000_0000_0000_0111)
 
     @classmethod
-    def text(cls) -> Self:
+    def text(cls) -> 'Permissions':
         """A factory method that creates a :class:`Permissions` with all
         "Text" permissions from the official Discord UI set to ``True``.
 
@@ -312,13 +430,13 @@ class Permissions(BaseFlags):
         return cls(0b0000_0000_0000_0110_0100_0000_0111_1100_1000_0000_0000_0111_1111_1000_0100_0000)
 
     @classmethod
-    def voice(cls) -> Self:
+    def voice(cls) -> 'Permissions':
         """A factory method that creates a :class:`Permissions` with all
         "Voice" permissions from the official Discord UI set to ``True``."""
         return cls(0b0000_0000_0000_0000_0010_0100_1000_0000_0000_0011_1111_0000_0000_0011_0000_0000)
 
     @classmethod
-    def stage(cls) -> Self:
+    def stage(cls) -> 'Permissions':
         """A factory method that creates a :class:`Permissions` with all
         "Stage Channel" permissions from the official Discord UI set to ``True``.
 
@@ -327,7 +445,7 @@ class Permissions(BaseFlags):
         return cls(1 << 32)
 
     @classmethod
-    def stage_moderator(cls) -> Self:
+    def stage_moderator(cls) -> 'Permissions':
         """A factory method that creates a :class:`Permissions` with all permissions
         for stage moderators set to ``True``. These permissions are currently:
 
@@ -343,7 +461,7 @@ class Permissions(BaseFlags):
         return cls(0b0000_0000_0000_0000_0000_0000_0000_0000_0000_0001_0100_0000_0000_0000_0001_0000)
 
     @classmethod
-    def elevated(cls) -> Self:
+    def elevated(cls) -> 'Permissions':
         """A factory method that creates a :class:`Permissions` with all permissions
         that require 2FA set to ``True``. These permissions are currently:
 
@@ -364,7 +482,7 @@ class Permissions(BaseFlags):
         return cls(0b0000_0000_0000_0000_0000_0001_0000_0100_0111_0000_0000_0000_0010_0000_0011_1110)
 
     @classmethod
-    def events(cls) -> Self:
+    def events(cls) -> 'Permissions':
         """A factory method that creates a :class:`Permissions` with all
         "Events" permissions from the official Discord UI set to ``True``.
 
@@ -373,7 +491,7 @@ class Permissions(BaseFlags):
         return cls(0b0000_0000_0000_0000_0001_0000_0000_0010_0000_0000_0000_0000_0000_0000_0000_0000)
 
     @classmethod
-    def advanced(cls) -> Self:
+    def advanced(cls) -> 'Permissions':
         """A factory method that creates a :class:`Permissions` with all
         "Advanced" permissions from the official Discord UI set to ``True``.
 
@@ -698,27 +816,19 @@ class Permissions(BaseFlags):
 
     @flag_value
     def use_embedded_activities(self) -> int:
-        """:class:`bool`: Returns ``True`` if a user can launch an embedded application in a Voice channel.
+        """:class:`bool`: Returns ``True`` if a user can use embedded activities.
 
-        .. versionadded:: 2.0
+        .. versionadded:: 2.3
         """
         return 1 << 39
 
     @flag_value
     def moderate_members(self) -> int:
-        """:class:`bool`: Returns ``True`` if a user can time out other members.
+        """:class:`bool`: Returns ``True`` if a user can moderate members.
 
-        .. versionadded:: 2.0
+        .. versionadded:: 2.3
         """
         return 1 << 40
-
-    @flag_value
-    def view_creator_monetization_analytics(self) -> int:
-        """:class:`bool`: Returns ``True`` if a user can view role subscription insights.
-
-        .. versionadded:: 2.4
-        """
-        return 1 << 41
 
     @flag_value
     def use_soundboard(self) -> int:
@@ -726,7 +836,7 @@ class Permissions(BaseFlags):
 
         .. versionadded:: 2.3
         """
-        return 1 << 42
+        return 1 << 41
 
     @flag_value
     def create_expressions(self) -> int:
@@ -734,11 +844,19 @@ class Permissions(BaseFlags):
 
         .. versionadded:: 2.3
         """
-        return 1 << 43
+        return 1 << 42
 
     @flag_value
     def create_events(self) -> int:
         """:class:`bool`: Returns ``True`` if a user can create guild events.
+
+        .. versionadded:: 2.4
+        """
+        return 1 << 43
+
+    @flag_value
+    def view_creator_monetization_analytics(self) -> int:
+        """:class:`bool`: Returns ``True`` if a user can view creator monetization analytics.
 
         .. versionadded:: 2.4
         """
@@ -944,7 +1062,7 @@ class PermissionOverwrite:
         return allow, deny
 
     @classmethod
-    def from_pair(cls, allow: Permissions, deny: Permissions) -> Self:
+    def from_pair(cls, allow: Permissions, deny: Permissions) -> 'PermissionOverwrite':
         """Creates an overwrite from an allow/deny pair of :class:`Permissions`."""
         ret = cls()
         for key, value in allow:
@@ -957,37 +1075,68 @@ class PermissionOverwrite:
 
         return ret
 
-    def is_empty(self) -> bool:
-        """Checks if the permission overwrite is currently empty.
-
-        An empty permission overwrite is one that has no overwrites set
-        to ``True`` or ``False``.
+    def to_dict(self) -> Dict[str, Optional[bool]]:
+        """Converts the permission overwrite to a dictionary mapping permission names to their values.
 
         Returns
-        -------
-        :class:`bool`
-            Indicates if the overwrite is empty.
+        --------
+        Dict[:class:`str`, Optional[:class:`bool`]]
+            A dictionary of permission names to their values (True, False, or None).
         """
-        return len(self._values) == 0
+        return self._values.copy()
 
-    def update(self, **kwargs: Optional[bool]) -> None:
-        r"""Bulk updates this permission overwrite object.
-
-        Allows you to set multiple attributes by using keyword
-        arguments. The names must be equivalent to the properties
-        listed. Extraneous key/value pairs will be silently ignored.
+    def get_missing_permissions(self, required: Permissions) -> List[str]:
+        """Returns a list of permission names that are missing from the current overwrite
+        compared to the required permissions.
 
         Parameters
-        ------------
-        \*\*kwargs
-            A list of key/value pairs to bulk update with.
+        -----------
+        required: :class:`Permissions`
+            The permissions to check against.
+
+        Returns
+        --------
+        List[:class:`str`]
+            A list of permission names that are missing.
         """
-        for key, value in kwargs.items():
-            if key not in self.VALID_NAMES:
-                continue
+        return [name for name, value in required if value and not self._values.get(name)]
 
-            setattr(self, key, value)
+    def has_any(self, *permissions: str) -> bool:
+        """Checks if any of the given permissions are allowed in this overwrite.
 
-    def __iter__(self) -> Iterator[Tuple[str, Optional[bool]]]:
-        for key in self.PURE_FLAGS:
-            yield key, self._values.get(key)
+        Parameters
+        -----------
+        *permissions: :class:`str`
+            The permission names to check.
+
+        Returns
+        --------
+        :class:`bool`
+            Whether any of the given permissions are allowed.
+
+        Raises
+        -------
+        TypeError
+            If any of the permission names are invalid.
+        """
+        return any(self._values.get(perm) for perm in permissions)
+
+    def has_all(self, *permissions: str) -> bool:
+        """Checks if all of the given permissions are allowed in this overwrite.
+
+        Parameters
+        -----------
+        *permissions: :class:`str`
+            The permission names to check.
+
+        Returns
+        --------
+        :class:`bool`
+            Whether all of the given permissions are allowed.
+
+        Raises
+        -------
+        TypeError
+            If any of the permission names are invalid.
+        """
+        return all(self._values.get(perm) for perm in permissions)
