@@ -35,8 +35,7 @@ import json
 import sys
 import re
 import io
-
-from typing import Any, Callable, Generic, IO, Optional, TYPE_CHECKING, Tuple, TypeVar, Union
+from typing import Any, Callable, Generic, IO, Optional, TYPE_CHECKING, Tuple, TypeVar, Union, List
 
 from .enums import SpeakingState
 from .errors import ClientException
@@ -698,6 +697,8 @@ class PCMVolumeTransformer(AudioSource, Generic[AT]):
 
 class AudioPlayer(threading.Thread):
     DELAY: float = OpusEncoder.FRAME_LENGTH / 1000.0
+    BUFFER_SIZE: int = 5  # Number of frames to buffer
+    MAX_RETRIES: int = 3  # Maximum number of retries for failed reads
 
     def __init__(
         self,
@@ -716,13 +717,76 @@ class AudioPlayer(threading.Thread):
         self._resumed.set()  # we are not paused
         self._current_error: Optional[Exception] = None
         self._lock: threading.Lock = threading.Lock()
+        self._buffer: List[bytes] = []
+        self._buffer_lock: threading.Lock = threading.Lock()
+        self._buffer_thread: Optional[threading.Thread] = None
+        self._buffer_event: threading.Event = threading.Event()
+        self._buffer_full: threading.Event = threading.Event()
+        self._retry_count: int = 0
+        self._last_read_time: float = 0.0
+        self._read_timeout: float = 5.0
 
         if after is not None and not callable(after):
             raise TypeError('Expected a callable for the "after" parameter.')
 
+    def _buffer_worker(self) -> None:
+        """Background thread to pre-buffer audio data."""
+        while not self._end.is_set():
+            if not self._resumed.is_set():
+                self._buffer_event.wait()
+                continue
+
+            try:
+                with self._buffer_lock:
+                    if len(self._buffer) >= self.BUFFER_SIZE:
+                        self._buffer_full.set()
+                        self._buffer_event.wait()
+                        continue
+
+                data = self._read_with_retry()
+                if not data:
+                    break
+
+                with self._buffer_lock:
+                    self._buffer.append(data)
+                    if len(self._buffer) >= self.BUFFER_SIZE:
+                        self._buffer_full.set()
+
+            except Exception as e:
+                _log.error("Error in buffer worker: %s", e)
+                self._current_error = e
+                break
+
+        self._buffer_full.set()
+
+    def _read_with_retry(self) -> bytes:
+        """Reads from source with retry logic."""
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                data = self.source.read()
+                self._last_read_time = time.time()
+                self._retry_count = 0
+                return data
+            except Exception as e:
+                self._retry_count += 1
+                if self._retry_count >= self.MAX_RETRIES:
+                    raise
+                _log.warning("Read attempt %d failed: %s", attempt + 1, e)
+                time.sleep(0.1)
+
+        return b''
+
     def _do_run(self) -> None:
         self.loops = 0
         self._start = time.perf_counter()
+
+        # Start buffer worker
+        self._buffer_thread = threading.Thread(
+            target=self._buffer_worker,
+            daemon=True,
+            name=f'audio-buffer:{id(self):#x}'
+        )
+        self._buffer_thread.start()
 
         # getattr lookup speed ups
         client = self.client
@@ -737,11 +801,20 @@ class AudioPlayer(threading.Thread):
                 self._resumed.wait()
                 continue
 
-            data = self.source.read()
+            # Check if we need to refill buffer
+            with self._buffer_lock:
+                if not self._buffer:
+                    if self._buffer_full.is_set():
+                        self.stop()
+                        break
+                    self._buffer_event.set()
+                    time.sleep(0.01)
+                    continue
 
-            if not data:
-                self.stop()
-                break
+                data = self._buffer.pop(0)
+                if len(self._buffer) < self.BUFFER_SIZE:
+                    self._buffer_full.clear()
+                    self._buffer_event.set()
 
             # are we disconnected from voice?
             if not client.is_connected():
@@ -775,6 +848,8 @@ class AudioPlayer(threading.Thread):
         finally:
             self._call_after()
             self.source.cleanup()
+            if self._buffer_thread:
+                self._buffer_thread.join(timeout=1.0)
 
     def _call_after(self) -> None:
         error = self._current_error
@@ -791,6 +866,7 @@ class AudioPlayer(threading.Thread):
     def stop(self) -> None:
         self._end.set()
         self._resumed.set()
+        self._buffer_event.set()
         self._speak(SpeakingState.none)
 
     def pause(self, *, update_speaking: bool = True) -> None:
@@ -802,6 +878,7 @@ class AudioPlayer(threading.Thread):
         self.loops: int = 0
         self._start: float = time.perf_counter()
         self._resumed.set()
+        self._buffer_event.set()
         if update_speaking:
             self._speak(SpeakingState.voice)
 
@@ -815,6 +892,10 @@ class AudioPlayer(threading.Thread):
         with self._lock:
             self.pause(update_speaking=False)
             self.source = source
+            with self._buffer_lock:
+                self._buffer.clear()
+            self._buffer_full.clear()
+            self._retry_count = 0
             self.resume(update_speaking=False)
 
     def _speak(self, speaking: SpeakingState) -> None:
