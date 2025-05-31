@@ -533,8 +533,16 @@ class HTTPClient:
             'total_requests': 0,
             'failed_requests': 0,
             'rate_limited_requests': 0,
-            'retried_requests': 0
+            'retried_requests': 0,
+            'cache_hits': 0,
+            'cache_misses': 0
         }
+
+        # Performance monitoring
+        self._request_times = []
+        self._max_request_time = 0
+        self._min_request_time = float('inf')
+        self._total_request_time = 0
 
         user_agent = 'DiscordBot (https://github.com/Rapptz/discord.py {0}) Python/{1[0]}.{1[1]} aiohttp/{2}'
         self.user_agent: str = user_agent.format(__version__, sys.version_info, aiohttp.__version__)
@@ -586,6 +594,15 @@ class HTTPClient:
         url = route.url
         route_key = route.key
 
+        # Check cache for GET requests
+        if method == 'GET':
+            cache_key = f"{route_key}:{route.major_parameters}"
+            cached_data = self._get_cached(cache_key)
+            if cached_data is not None:
+                self._request_stats['cache_hits'] += 1
+                return cached_data
+            self._request_stats['cache_misses'] += 1
+
         bucket_hash = None
         try:
             bucket_hash = self._bucket_hashes[route_key]
@@ -603,7 +620,7 @@ class HTTPClient:
 
         if self.token is not None:
             headers['Authorization'] = 'Bot ' + self.token
-        # some checking if it's a JSON request
+
         if 'json' in kwargs:
             headers['Content-Type'] = 'application/json'
             kwargs['data'] = utils._to_json(kwargs.pop('json'))
@@ -618,18 +635,18 @@ class HTTPClient:
 
         kwargs['headers'] = headers
 
-        # Proxy support
         if self.proxy is not None:
             kwargs['proxy'] = self.proxy
         if self.proxy_auth is not None:
             kwargs['proxy_auth'] = self.proxy_auth
 
         if not self._global_over.is_set():
-            # wait until the global lock is complete
             await self._global_over.wait()
 
         response: Optional[aiohttp.ClientResponse] = None
         data: Optional[Union[Dict[str, Any], str]] = None
+        start_time = time.perf_counter()
+
         async with ratelimit:
             for tries in range(5):
                 if files:
@@ -637,7 +654,6 @@ class HTTPClient:
                         f.reset(seek=tries)
 
                 if form:
-                    # with quote_fields=True '[' and ']' in file field names are escaped, which discord does not support
                     form_data = aiohttp.FormData(quote_fields=False)
                     for params in form:
                         form_data.add_field(**params)
@@ -647,38 +663,30 @@ class HTTPClient:
                     async with self.__session.request(method, url, **kwargs) as response:
                         _log.debug('%s %s with %s has returned %s', method, url, kwargs.get('data'), response.status)
 
-                        # even errors have text involved in them so this is safe to call
                         data = await json_or_text(response)
 
-                        # Update and use rate limit information if the bucket header is present
+                        # Update request statistics
+                        request_time = time.perf_counter() - start_time
+                        self._request_times.append(request_time)
+                        self._max_request_time = max(self._max_request_time, request_time)
+                        self._min_request_time = min(self._min_request_time, request_time)
+                        self._total_request_time += request_time
+                        self._request_stats['total_requests'] += 1
+
+                        # Handle rate limits
                         discord_hash = response.headers.get('X-Ratelimit-Bucket')
-                        # I am unsure if X-Ratelimit-Bucket is always available
-                        # However, X-Ratelimit-Remaining has been a consistent cornerstone that worked
                         has_ratelimit_headers = 'X-Ratelimit-Remaining' in response.headers
+
                         if discord_hash is not None:
-                            # If the hash Discord has provided is somehow different from our current hash something changed
                             if bucket_hash != discord_hash:
                                 if bucket_hash is not None:
-                                    # If the previous hash was an actual Discord hash then this means the
-                                    # hash has changed sporadically.
-                                    # This can be due to two reasons
-                                    # 1. It's a sub-ratelimit which is hard to handle
-                                    # 2. The rate limit information genuinely changed
-                                    # There is no good way to discern these, Discord doesn't provide a way to do so.
-                                    # At best, there will be some form of logging to help catch it.
-                                    # Alternating sub-ratelimits means that the requests oscillate between
-                                    # different underlying rate limits -- this can lead to unexpected 429s
-                                    # It is unavoidable.
-                                    fmt = 'A route (%s) has changed hashes: %s -> %s.'
-                                    _log.debug(fmt, route_key, bucket_hash, discord_hash)
-
+                                    _log.debug('Route %s has changed hashes: %s -> %s', route_key, bucket_hash, discord_hash)
                                     self._bucket_hashes[route_key] = discord_hash
                                     recalculated_key = discord_hash + route.major_parameters
                                     self._buckets[recalculated_key] = ratelimit
                                     self._buckets.pop(key, None)
                                 elif route_key not in self._bucket_hashes:
-                                    fmt = '%s has found its initial rate limit bucket hash (%s).'
-                                    _log.debug(fmt, route_key, discord_hash)
+                                    _log.debug('%s has found its initial rate limit bucket hash (%s)', route_key, discord_hash)
                                     self._bucket_hashes[route_key] = discord_hash
                                     self._buckets[discord_hash + route.major_parameters] = ratelimit
 
