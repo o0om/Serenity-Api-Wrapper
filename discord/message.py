@@ -43,7 +43,11 @@ from typing import (
     ClassVar,
     Type,
     overload,
+    ClassVar,
+    Type,
+    overload,
 )
+import time
 
 from . import utils
 from .asset import Asset
@@ -2128,6 +2132,8 @@ class Message(PartialMessage, Hashable):
         'call',
         'purchase_notification',
         'message_snapshots',
+        '_cache_ttl',  # Time-to-live for cached properties
+        '_last_cache_update',  # Timestamp of last cache update
     )
 
     if TYPE_CHECKING:
@@ -2147,6 +2153,8 @@ class Message(PartialMessage, Hashable):
         channel: MessageableChannel,
         data: MessagePayload,
     ) -> None:
+        self._cache_ttl = 300  # 5 minutes TTL for cached properties
+        self._last_cache_update = time.time()
         self.channel: MessageableChannel = channel
         self.id: int = int(data['id'])
         self._state: ConnectionState = state
@@ -2463,6 +2471,21 @@ class Message(PartialMessage, Hashable):
         self.guild = new_guild
         self.channel = new_channel  # type: ignore # Not all "GuildChannel" are messageable at the moment
 
+    def _clear_cached_properties(self) -> None:
+        """Clear all cached properties to free memory."""
+        for attr in self._CACHED_SLOTS:
+            try:
+                delattr(self, attr)
+            except AttributeError:
+                pass
+
+    def _check_cache_ttl(self) -> None:
+        """Check if cached properties should be cleared based on TTL."""
+        current_time = time.time()
+        if current_time - self._last_cache_update > self._cache_ttl:
+            self._clear_cached_properties()
+            self._last_cache_update = current_time
+
     @utils.cached_slot_property('_cs_raw_mentions')
     def raw_mentions(self) -> List[int]:
         """List[:class:`int`]: A property that returns an array of user IDs matched with
@@ -2471,6 +2494,7 @@ class Message(PartialMessage, Hashable):
         This allows you to receive the user IDs of mentioned users
         even in a private message context.
         """
+        self._check_cache_ttl()
         return [int(x) for x in re.findall(r'<@!?([0-9]{15,20})>', self.content)]
 
     @utils.cached_slot_property('_cs_raw_channel_mentions')
@@ -2987,3 +3011,158 @@ class Message(PartialMessage, Hashable):
             The newly edited message.
         """
         return await self.edit(attachments=[a for a in self.attachments if a not in attachments])
+
+    def _validate_message_content(self, content: Optional[str]) -> None:
+        """Validates message content length.
+        
+        Raises
+        -------
+        ValueError
+            If the content length exceeds Discord's limit.
+        """
+        if content is not None and len(str(content)) > 2000:
+            raise ValueError('Message content must be 2000 or fewer characters.')
+
+    def _validate_embeds(self, embeds: Optional[Sequence[Embed]]) -> None:
+        """Validates embed count.
+        
+        Raises
+        -------
+        ValueError
+            If there are too many embeds.
+        """
+        if embeds is not None and len(embeds) > 10:
+            raise ValueError('Message can only have up to 10 embeds.')
+
+    def _validate_attachments(self, attachments: Optional[Sequence[Union[Attachment, File]]]) -> None:
+        """Validates attachments.
+        
+        Raises
+        -------
+        ValueError
+            If attachments are invalid or too many.
+        """
+        if attachments is not None:
+            if not all(isinstance(attachment, (Attachment, File)) for attachment in attachments):
+                raise ValueError('All attachments must be either Attachment or File objects.')
+            
+            if len(attachments) > 10:
+                raise ValueError('Message can only have up to 10 attachments.')
+
+    def _validate_view(self, view: Optional[View]) -> None:
+        """Validates view object.
+        
+        Raises
+        -------
+        TypeError
+            If view is not a View instance.
+        """
+        if view is not None and not isinstance(view, View):
+            raise TypeError('view parameter must be View not {0.__class__.__name__}'.format(view))
+
+    async def edit(
+        self,
+        *,
+        content: Optional[str] = MISSING,
+        embed: Optional[Embed] = MISSING,
+        embeds: Sequence[Embed] = MISSING,
+        attachments: Sequence[Union[Attachment, File]] = MISSING,
+        suppress: bool = False,
+        delete_after: Optional[float] = None,
+        allowed_mentions: Optional[AllowedMentions] = MISSING,
+        view: Optional[View] = MISSING,
+    ) -> Message:
+        """|coro|
+
+        Edits the message.
+
+        The content must be able to be transformed into a string via ``str(content)``.
+
+        Parameters
+        -----------
+        content: Optional[:class:`str`]
+            The new content to replace the message with.
+            Could be ``None`` to remove the content.
+        embed: Optional[:class:`Embed`]
+            The new embed to replace the original with.
+            Could be ``None`` to remove the embed.
+        embeds: List[:class:`Embed`]
+            The new embeds to replace the original with. Must be a maximum of 10.
+            To remove all embeds ``[]`` should be passed.
+        attachments: List[Union[:class:`Attachment`, :class:`File`]]
+            A list of attachments to keep in the message as well as new files to upload. If ``[]`` is passed
+            then all attachments are removed.
+        suppress: :class:`bool`
+            Whether to suppress embeds for the message.
+        delete_after: Optional[:class:`float`]
+            If provided, the number of seconds to wait in the background
+            before deleting the message we just edited.
+        allowed_mentions: Optional[:class:`~discord.AllowedMentions`]
+            Controls the mentions being processed in this message.
+        view: Optional[:class:`~discord.ui.View`]
+            The updated view to update this message with.
+
+        Raises
+        -------
+        HTTPException
+            Editing the message failed.
+        Forbidden
+            Tried to suppress a message without permissions or
+            edited a message's content or embed that isn't yours.
+        NotFound
+            This message does not exist.
+        ValueError
+            The content length exceeds Discord's limit or there are too many embeds/attachments.
+        TypeError
+            You specified both ``embed`` and ``embeds`` or the view parameter is invalid.
+        """
+        try:
+            if content is not MISSING:
+                self._validate_message_content(content)
+                previous_allowed_mentions = self._state.allowed_mentions
+            else:
+                previous_allowed_mentions = None
+
+            if embeds is not MISSING:
+                self._validate_embeds(embeds)
+
+            if attachments is not MISSING:
+                self._validate_attachments(attachments)
+
+            if view is not MISSING:
+                self._validate_view(view)
+                self._state.prevent_view_updates_for(self.id)
+
+            if suppress is not MISSING:
+                flags = MessageFlags._from_value(self.flags.value)
+                flags.suppress_embeds = suppress
+            else:
+                flags = MISSING
+
+            with handle_message_parameters(
+                content=content,
+                flags=flags,
+                embed=embed,
+                embeds=embeds,
+                attachments=attachments,
+                view=view,
+                allowed_mentions=allowed_mentions,
+                previous_allowed_mentions=previous_allowed_mentions,
+            ) as params:
+                data = await self._state.http.edit_message(self.channel.id, self.id, params=params)
+                message = Message(state=self._state, channel=self.channel, data=data)
+
+            if view and not view.is_finished():
+                self._state.store_view(view, self.id)
+
+            if delete_after is not None:
+                await self.delete(delay=delete_after)
+
+            return message
+
+        except HTTPException as e:
+            raise HTTPException(f'Failed to edit message: {str(e)}', e.response)
+        except Forbidden as e:
+            raise Forbidden('You do not have permission to edit this message.', e.response)
+        except NotFound as e:
+            raise NotFound('Message not found.', e.response)
