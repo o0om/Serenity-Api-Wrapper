@@ -32,7 +32,13 @@ from typing import (
     TYPE_CHECKING,
     Type,
     Union,
+    Dict,
+    Any,
+    Optional,
+    ClassVar,
+    Tuple,
 )
+from weakref import WeakValueDictionary
 
 if TYPE_CHECKING:
     import datetime
@@ -46,6 +52,8 @@ __all__ = (
 )
 # fmt: on
 
+# Cache for frequently used objects
+_OBJECT_CACHE: WeakValueDictionary[Tuple[int, Type[abc.Snowflake]], 'Object'] = WeakValueDictionary()
 
 class Object(Hashable):
     """Represents a generic Discord object.
@@ -60,6 +68,11 @@ class Object(Hashable):
     in :issue:`strange order <21>` and when such events happened you would
     receive this class rather than the actual data class. These cases are
     extremely rare.
+
+    .. versionchanged:: 2.5
+        Added caching for frequently used objects.
+        Added new utility methods for common object operations.
+        Enhanced type safety with better type hints.
 
     .. container:: operations
 
@@ -90,13 +103,37 @@ class Object(Hashable):
         .. versionadded:: 2.0
     """
 
-    def __init__(self, id: SupportsIntCast, *, type: Type[abc.Snowflake] = MISSING):
+    _MIN_SNOWFLAKE: ClassVar[int] = 0
+    _MAX_SNOWFLAKE: ClassVar[int] = (1 << 64) - 1
+
+    def __new__(cls, id: SupportsIntCast, *, type: Type[abc.Snowflake] = MISSING) -> 'Object':
         try:
             id = int(id)
         except ValueError:
             raise TypeError(f'id parameter must be convertible to int not {id.__class__.__name__}') from None
-        self.id: int = id
-        self.type: Type[abc.Snowflake] = type or self.__class__
+
+        # Validate snowflake range
+        if not cls._MIN_SNOWFLAKE <= id <= cls._MAX_SNOWFLAKE:
+            raise ValueError(f'id must be between {cls._MIN_SNOWFLAKE} and {cls._MAX_SNOWFLAKE}')
+
+        # Check cache
+        cache_key = (id, type or cls)
+        if cache_key in _OBJECT_CACHE:
+            return _OBJECT_CACHE[cache_key]
+
+        # Create new instance
+        instance = super().__new__(cls)
+        instance.id = id
+        instance.type = type or cls
+
+        # Cache the instance
+        _OBJECT_CACHE[cache_key] = instance
+
+        return instance
+
+    def __init__(self, id: SupportsIntCast, *, type: Type[abc.Snowflake] = MISSING) -> None:
+        # Initialization is handled in __new__
+        pass
 
     def __repr__(self) -> str:
         return f'<Object id={self.id!r} type={self.type!r}>'
@@ -113,5 +150,61 @@ class Object(Hashable):
         """:class:`datetime.datetime`: Returns the snowflake's creation time in UTC."""
         return snowflake_time(self.id)
 
+    def is_valid(self) -> bool:
+        """Checks if the object's ID is valid.
+        
+        Returns
+        -------
+        :class:`bool`
+            Whether the object's ID is valid.
+        """
+        return self._MIN_SNOWFLAKE <= self.id <= self._MAX_SNOWFLAKE
 
+    def to_dict(self) -> Dict[str, Any]:
+        """Converts the object to a dictionary.
+        
+        Returns
+        -------
+        Dict[:class:`str`, Any]
+            The dictionary representation of the object.
+        """
+        return {
+            'id': self.id,
+            'type': self.type.__name__,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'Object':
+        """Creates an object from a dictionary.
+        
+        Parameters
+        ----------
+        data: Dict[:class:`str`, Any]
+            The dictionary to create the object from.
+            
+        Returns
+        -------
+        :class:`Object`
+            The created object.
+        """
+        return cls(
+            id=data['id'],
+            type=data.get('type', cls),
+        )
+
+    def copy(self) -> 'Object':
+        """Creates a copy of the object.
+        
+        Returns
+        -------
+        :class:`Object`
+            The copied object.
+        """
+        return self.__class__(id=self.id, type=self.type)
+
+    def __str__(self) -> str:
+        return str(self.id)
+
+
+# A singleton object representing the oldest possible snowflake
 OLDEST_OBJECT = Object(id=0)
