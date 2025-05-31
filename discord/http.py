@@ -48,6 +48,7 @@ from typing import (
 from urllib.parse import quote as _uriquote
 from collections import deque
 import datetime
+import time
 
 import aiohttp
 
@@ -512,14 +513,7 @@ class HTTPClient:
         self.loop: asyncio.AbstractEventLoop = loop
         self.connector: aiohttp.BaseConnector = connector or MISSING
         self.__session: aiohttp.ClientSession = MISSING  # filled in static_login
-        # Route key -> Bucket hash
         self._bucket_hashes: Dict[str, str] = {}
-        # Bucket Hash + Major Parameters -> Rate limit
-        # or
-        # Route key + Major Parameters -> Rate limit
-        # When the key is the latter, it is used for temporary
-        # one shot requests that don't have a bucket hash
-        # When this reaches 256 elements, it will try to evict based off of expiry
         self._buckets: Dict[str, Ratelimit] = {}
         self._global_over: asyncio.Event = MISSING
         self.token: Optional[str] = None
@@ -528,6 +522,19 @@ class HTTPClient:
         self.http_trace: Optional[aiohttp.TraceConfig] = http_trace
         self.use_clock: bool = not unsync_clock
         self.max_ratelimit_timeout: Optional[float] = max(30.0, max_ratelimit_timeout) if max_ratelimit_timeout else None
+
+        # Enhanced rate limiting and error handling
+        self._retry_after = 0
+        self._max_retries = 5
+        self._backoff = ExponentialBackoff()
+        self._cache = {}
+        self._cache_ttl = 300  # 5 minutes default TTL
+        self._request_stats = {
+            'total_requests': 0,
+            'failed_requests': 0,
+            'rate_limited_requests': 0,
+            'retried_requests': 0
+        }
 
         user_agent = 'DiscordBot (https://github.com/Rapptz/discord.py {0}) Python/{1[0]}.{1[1]} aiohttp/{2}'
         self.user_agent: str = user_agent.format(__version__, sys.version_info, aiohttp.__version__)
@@ -2769,3 +2776,97 @@ class HTTPClient:
 
     def get_user(self, user_id: Snowflake) -> Response[user.User]:
         return self.request(Route('GET', '/users/{user_id}', user_id=user_id))
+
+    async def _handle_rate_limit(self, response: aiohttp.ClientResponse, data: Dict[str, Any]) -> bool:
+        """Handle rate limit responses with exponential backoff."""
+        if response.status == 429:
+            retry_after = data.get('retry_after', 0)
+            self._retry_after = retry_after
+            self._request_stats['rate_limited_requests'] += 1
+            
+            # Log rate limit hit
+            _log.warning(
+                'Rate limit hit. Retrying after %.2f seconds. Endpoint: %s',
+                retry_after,
+                response.url
+            )
+            
+            await asyncio.sleep(retry_after)
+            return True
+        return False
+
+    async def _handle_errors(self, response: aiohttp.ClientResponse, data: Dict[str, Any]) -> bool:
+        """Handle various error responses with retries and backoff."""
+        if response.status >= 500:
+            self._request_stats['failed_requests'] += 1
+            retry_count = 0
+            
+            while retry_count < self._max_retries:
+                retry_count += 1
+                self._request_stats['retried_requests'] += 1
+                
+                # Calculate backoff delay
+                delay = self._backoff.delay()
+                _log.warning(
+                    'Server error %d. Retrying in %.2f seconds (attempt %d/%d)',
+                    response.status,
+                    delay,
+                    retry_count,
+                    self._max_retries
+                )
+                
+                await asyncio.sleep(delay)
+                try:
+                    return await self._request(response.method, response.url, **response.request_info)
+                except Exception as e:
+                    if retry_count == self._max_retries:
+                        _log.error('Max retries exceeded for request: %s', str(e))
+                        raise
+        return False
+
+    async def _request(self, method: str, url: str, **kwargs) -> Tuple[aiohttp.ClientResponse, Dict[str, Any]]:
+        """Enhanced request method with improved error handling and caching."""
+        self._request_stats['total_requests'] += 1
+        
+        # Check cache for GET requests
+        if method == 'GET':
+            cache_key = f"{method}:{url}:{kwargs.get('params', {})}"
+            cached_data = self._get_cached(cache_key)
+            if cached_data is not None:
+                _log.debug('Cache hit for %s', url)
+                return None, cached_data
+
+        async with self.__session.request(method, url, **kwargs) as response:
+            data = await json_or_text(response)
+            
+            if await self._handle_rate_limit(response, data):
+                return await self._request(method, url, **kwargs)
+                
+            if await self._handle_errors(response, data):
+                return await self._request(method, url, **kwargs)
+            
+            # Cache successful GET responses
+            if method == 'GET' and response.status == 200:
+                self._update_cache(cache_key, data)
+                
+            return response, data
+
+    def _update_cache(self, key: str, value: Any) -> None:
+        """Update the request cache with a new value."""
+        self._cache[key] = {
+            'value': value,
+            'expires': time.time() + self._cache_ttl
+        }
+
+    def _get_cached(self, key: str) -> Optional[Any]:
+        """Get a value from the cache if it exists and hasn't expired."""
+        if key in self._cache:
+            cache_data = self._cache[key]
+            if time.time() < cache_data['expires']:
+                return cache_data['value']
+            del self._cache[key]
+        return None
+
+    def get_request_stats(self) -> Dict[str, int]:
+        """Get statistics about the HTTP client's performance."""
+        return self._request_stats.copy()
